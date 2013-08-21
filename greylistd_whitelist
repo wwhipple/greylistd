@@ -1,0 +1,90 @@
+#################################################################
+# Space-separated IP's/CIDR patterns that we don't greylist
+# because their MTA's are
+# 1. broken, OR
+# 2. a pool of servers (with different IPs) that service the mail queue(s)
+# 3. other reason
+
+127.0.0.0/8
+
+12.10.219.0/24 # American Express (Strange retry behavior)
+38.107.108.120/29 63.211.90.152/29 # Staples.com
+64.74.98.0/24 70.42.142.0/24 208.111.169.0/24 208.111.172.0/24 # LinkedIn
+66.211.160.0/19 66.135.192.0/19 216.33.244.0/22  # ebay.com/paypal.com
+165.193.208.0/23  # TheLadders.com
+186.104.35.100/32 190.65.183.103/32 # blin.com
+192.223.128.0/17               # Fidelity Investments 
+199.81.0.0/16 199.82.0.0/16    # fedex.com
+204.15.240.0/22                # plaxo.com
+208.75.123.0/22 63.251.135.64/26   # constantcontact.com
+209.225.8.0/24 216.33.127.0/24 # charter.net
+209.237.134.230/32 209.237.135.70/32 # communitytitlellc.com
+216.33.63.0/24 206.132.3.0/24 # bigfootinteractive.com
+66.33.216.100/32 67.205.8.12/32 # dreamhost.com
+68.230.241.0/24 68.96.71.0/24 # cox.net
+
+69.25.74.128/26 70.42.50.128/26 # bluestatedigital.com
+
+69.63.176.0/20  # facebook.com
+76.13.13.0/24 98.137.26.0/24 98.136.167.0/24  # yahoo.com (ymail)
+76.96.0.0/17 76.96.128.0/18 76.96.192.0/21 # comcast
+
+17.148.16.86/31 17.148.16.88/29 17.148.16.98/31 17.148.16.100/30 17.148.16.104/31 17.148.16.110/31 # Apple SMTP pool
+17.250.236.193/32 17.250.236.194/31 17.250.236.196/31 17.254.13.36/32 17.254.13.38/32 # More Apple
+
+12.5.136.0/24 63.169.44.0/24 # Southwest Airlines
+12.107.209.244/32 # kernel.org
+12.107.209.250/32  # sourceware.org
+209.132.176.174/32 # sourceware.org mailing lists (unique sender)
+64.7.153.18/32    # sentex.ca
+63.82.37.110/32   # SLmail
+
+64.12.0.0/16 152.163.0.0/16 205.188.0.0/16  # AOL
+
+64.124.204.39     # moveon.org
+64.125.132.254/32 # collab.net
+
+64.233.160.0/19   # Google
+66.102.0.0/20 66.249.80.0/20 72.14.192.0/18 74.125.0.0/16 # Google (Postini too)
+209.85.128.0/17   # Google
+216.239.32.0/19   # Google
+
+# Postini (http://www.google.pl/support/forum/p/AppSecurity/thread?tid=0468f44adeb8c26b&hl=en)
+# Also includes 74.125.148.0/22 included above
+64.18.0.0/20 207.126.144.0/20 
+
+66.94.237.16/28 66.94.237.32/28 66.94.237.48/30 # Yahoo
+66.218.66.0/23 66.218.67.0/23 66.218.68.0/23 66.218.69.0/23 # Yahoo
+
+66.100.210.82/32 66.162.216.166/32 # Groupwise?
+
+66.206.22.82/32 66.206.22.83/32 66.206.22.84/32 66.206.22.85/32 # Plexor
+66.27.51.218/32   # ljbtc.com (Groupwise)
+
+# priorityoneemail.com:
+69.10.237.22/31 69.10.237.24/31 69.10.237.26/32
+69.10.237.37/32 69.10.237.38/31 69.10.237.40/31
+69.10.237.52/31 69.10.237.54/31 69.10.237.56/32
+
+194.245.101.88/32 # Joker.com
+
+193.33.186.241/32 193.33.186.242/31 193.33.186.244/30 193.33.186.248/31 193.33.186.250/32 # releasesource*.com aka knoticesummary.com
+
+195.235.39.19/32  # Tid InfoMail Exchanger v2.20
+
+195.238.2.0/24 195.238.3.0/24  # skynet.be
+
+195.46.220.208/32 195.46.220.209/32 195.46.220.210/32 195.46.220.211/32 195.46.220.221/32 195.46.220.222/32   # mgn.net
+
+204.107.120.10/32 # Ameritrade (no retry)
+
+205.206.231.0/24  # SecurityFocus.com (unique sender)
+
+207.115.63.0/24   # Prodigy - retries continually
+
+207.171.168.0/24 207.171.180.0/24 207.171.187.0/24 207.171.188.0/24 207.171.190.0/24 # Amazon.com
+
+211.29.132.0/24   # optusnet.com.au (wierd retry pattern)
+213.136.52.31/32  # Mysql.com (unique sender)
+217.158.50.178/32 # AXKit mailing list (unique sender)
+

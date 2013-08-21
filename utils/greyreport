@@ -1,0 +1,168 @@
+#!/usr/bin/perl -w
+#
+# Report email that was effectively rejected
+# Copyright (C) 2010  Weldon Whipple <weldon@whipple.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Author: Weldon Whipple <weldon@whipple.org>
+# 3/11/2010
+
+# Show email that was effectively rejected by scanning DEFERRED
+# entries in the greylistd log. Compare those entries with the list of
+# greylistd's verified and grey lists. Those that appear in neither
+# place are considered rejected (i.e., they didn't retry delivery).
+#
+
+use strict;
+use Getopt::Long;
+
+my $GREYADM_PGM = '/usr/local/sbin/greyadm';
+
+my ($show_log_entries, $logfile, $domain, $addr, $help);
+
+## Get options, if specified
+unless (GetOptions(
+                   'entries'   => \$show_log_entries, # Show log entries as well
+                   'logfile=s' => \$logfile, # Name of logfile 
+                   'domain=s'  => \$domain,  # Show rejects for specified domain
+                   'addr=s'    => \$addr,    # Show rejects for specified email address
+                   'help'      => \$help,    # Help
+                   )) { 
+    usage(); 
+    exit; 
+}
+
+if (scalar(@ARGV) || $help) {
+    usage();
+    exit;
+}
+
+# Must be root:
+die "Only root can run this.\n" if $<;
+
+$logfile ||= '/var/log/greylistd.log';
+unless (-r $logfile) {
+    die "Can't read log file $logfile\n";
+}
+
+my %greylist = ();
+my %verified = ();
+
+##########################################
+# G E T   C U R R E N T   G R E Y L I S T
+open(my $gfh, "-|", "$GREYADM_PGM", "-g", "-n", "-b")
+    or die "Unable to invoke $GREYADM_PGM: $!\n";
+
+my $num_lines = 0;
+while (<$gfh>) {
+    $num_lines++;
+    if ($num_lines == 1 && /Request submitted/) {
+	last;			# No greylist
+    }
+    my ($ip, $from, $to, $extra) = split("\t", $_, 4);
+    my ($ippfx) = $ip =~ /^\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\./; # 1st 3 pieces only
+    $greylist{"${ippfx}__${from}__${to}"} = 1;
+}
+
+close $gfh;
+
+#####################################################
+# G E T   C U R R E N T   V E R I F I E D   L I S T
+open(my $vfh, "-|", "$GREYADM_PGM", "-v", "-n", "-b")
+    or die "Unable to invoke $GREYADM_PGM: $!\n";
+
+$num_lines = 0;
+while (<$vfh>) {
+    $num_lines++;
+    if ($num_lines == 1 && /Request submitted/) {
+	last;			# No greylist
+    }
+    my ($ip, $from, $to, $extra) = split("\t", $_, 4);
+    my ($ippfx) = $ip =~ /^\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\./; # 1st 3 pieces only
+    $verified{"${ippfx}__${from}__${to}"} = 1;
+}
+
+close $vfh;
+
+my ($bydomain, $byaddr);
+if (defined($domain) && length($domain)) {
+    $bydomain = 1;
+}
+else {
+    $bydomain = 0;
+}
+
+if (defined($addr) && length($addr)) {
+    $byaddr = 1;
+}
+else {
+    $byaddr = 0;
+}
+
+my $num_deferred = 0;           # Total
+my $num_greylisted = 0;         # Currently greylisted
+my $num_verified = 0;           # Number verified
+my $num_rejected = 0;           # Rejected (not greylisted or verified)
+#####################################################
+# R E A D   T H E   L O G
+open(LOG, "< $logfile") or die("Unable to open log file $logfile: $!\n");
+
+while (<LOG>) {
+    unless (/ DEFER /) {
+	next;			# We're interested only in DEFERred email
+    }
+
+    my ($ip, $class_c, $from, $to, $todomain) 
+	= $_ =~ m/ DEFER mail from ((\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}) address (.+?), to ([^@]+\@([^ ]+)) /;
+    if ($bydomain && ($todomain ne $domain)) {
+	next;			# We're not interested in this "to" domain
+    }
+
+    if ($byaddr && ($to ne $addr)) {
+      next:			# We're not interested in this address
+    }
+
+    $num_deferred++;
+
+    # Is this verified at the moment?
+    if (exists $verified{"${class_c}__${from}__${to}"}) {
+	# It's been verified. It isn't a reject
+        $num_verified++;
+	next;
+    }
+
+    # Is this still in the greylist? (If so, it hasn't been rejected ... yet
+    if (exists $greylist{"${class_c}__${from}__${to}"}) {
+        $num_greylisted++;
+	next;
+    }
+
+    # We're still here. It was rejected
+    if ($show_log_entries) {
+        print;
+    }
+    $num_rejected++;
+}
+
+
+print "From greylistd.log:\n";
+print "-----------------------------\n";
+printf("   Total verified: %10d\n", $num_verified);
+printf(" Still greylisted: %10d\n", $num_greylisted);
+printf("   Total rejected: %10d\n", $num_rejected);
+printf("=============================\n");
+printf("  Total deferrals: %10d\n", $num_deferred);
+
+exit;

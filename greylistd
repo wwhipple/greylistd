@@ -1,0 +1,1795 @@
+#!/usr/bin/perl -w
+#
+# Greylisting Daemon for Exim
+# Copyright (C) 2010  Weldon Whipple <weldon@whipple.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# To do: IPv6, International domain names (might work already), ...
+#        Make stats less hoaky (more i18n-compliant)
+
+use strict;
+use Getopt::Long;
+
+use IO::Handle;
+use IO::File;
+use IO::Socket;
+use Fcntl qw(F_SETFD);
+use File::Copy;
+use Proc::Daemon;
+use Proc::PID::File;
+use Linux::Inotify2;
+use Cwd 'abs_path';
+
+use Time::HiRes qw(gettimeofday tv_interval);
+use POSIX;
+
+use constant MAX_32BIT => 0xFFFFFFFF;
+
+# Log level constants: higher numeric values include functionality of
+# lower numeric values
+use constant LOG_DEBUG     => 7; # Most verbose. Log everything
+use constant LOG_INFO      => 6; # Dump greylist/verified info to file
+use constant LOG_NOTICE    => 5; # Normal but significant
+use constant LOG_WHITE_OPT => 4; # Whitelisted or not opted in; list reread (inotify)
+use constant LOG_VERIFIED  => 3; # Verified previously/verification expired
+use constant LOG_DEFER     => 2; # Show deferrals/first accept
+use constant LOG_ERR       => 1; # Config err/unknown sock command/bad IP, etc.
+use constant LOG_OFF       => 0; # No logging at all
+
+# Number of seconds in larger time periods
+use constant WEEKSECS   => 604800;
+use constant DAYSECS    => 86400;
+use constant HOURSECS   => 3600;
+use constant MINSECS    => 60;
+
+delete @ENV{qw(IFS CDPATH ENV PATH BASH_ENV)}; # Clean environment
+
+my $version = '1.2.2a';
+
+my @start = gettimeofday();
+
+# (We dump/serialize the greylist to a file periodically for persistence)
+my %greylist = ();          # The greylist
+my %ip_whitelist = ();      # Never defer mail from these addrs (CIDR)
+
+# TODO: These could probably be merged?? (WLW 2/18/2010)
+my %optin_rcpt_domain = (); # RCPT domains that have opted in
+my %optin_rcpt_addr = ();   # RCPT addresses (user@domain) that have opted in
+
+my $runpath = abs_path($0);
+my ($dir, $parentdir, $fname) = $runpath =~ m/^((.*)\/[^\/]+)\/([^\/]+)$/;
+
+# Some configuration defaults (unless overridden by greylistd.conf):
+my %conf = (
+    dumpfile          => '/etc/greylistd.data', # Dump greylist here
+    dumpfreq          => 300,      # Seconds between writing out greylist data
+    log_file          => '/var/log/greylistd.log',   # Log here
+    log_level         => LOG_NOTICE, # Errors + greylist + normal/significant conditions
+    second_try_max    => 7200,     # Must knock second time within this time
+    second_try_min    => 10,       # Must want num secs before knocking again
+    socket            => '/ramdisk/var/spool/exim/greylistd.sock', # Use unix domain sock 
+    pidfile           => '/var/run/greylistd.pid',   # Where we store our process ID 
+    eximuser          => 'mailnull',   # User exim runs as
+    eximgroup         => 'nobody',     # Group exim runs as
+    vfy_duration      => 129600,   # After 36 days of inactivity, purge from whitelist
+    ip_whitelist_file => {},       # Don't defer mail from IPs in these files (CIDR notation) 
+    optin_dir         => '/etc/greylist', # Contains per-cpanel user-named files containing 
+                                          # optin domains/email addresses
+    );
+
+my $optins_wildcarded = 0;      # We don't know that optins are wildcarded (yet)
+
+my %stats = (
+             '01_Start_Time'                                => strftime("%F %T", localtime($start[0])),
+             '02_Total_Requests_Since_Restart'              => 0,
+             '03_Total_Greylist_Checks_Since_Restart'       => 0,
+             '04_Total_Emails_Deferred_Since_Restart'       => 0,
+             '05_Total_Emails_Accepted_Since_Restart'       => 0,
+             '06_Total_Emails_to_Non_Optin_Addresses'       => 0,
+             '07_Total_Emails_from_Whitelisted_IPs'         => 0,
+             '08_Total_Relay_Server_IP_Whitelist_Entries'   => 0,
+             '09_Total_Optin_Recipient_Addresses'           => 0,
+             '10_Total_Optin_Recipient_Domains'             => 0,
+             '11_Total_Triplets_Verified_Since_Restart'     => 0, # ... counting since daemon started
+             '12_Total_Triplets_Greylisted_Since_Restart'   => 0,
+             '13_Current_Number_of_Verified_Triplets'       => 0,
+             '14_Current_Number_of_Greylisted_Triplets'     => 0
+             );
+
+my $logfd;                      # For logging
+
+my $show_version = 0;           # Display version and exit
+my $help = 0;
+my $daemon = 1;                 # Run as a daemon by default
+my $loglevel = -1;              # Will override the conf file if > -1
+my $debug = 0;                  # Don't debug unless requested
+my $pidfh;
+my $pid = -1;                   # Initialize it for END
+
+# Commands we can get sent via the socket:
+my %run = (
+           IS_DEFERRED             => \&is_deferred,
+           IS_WHITELISTED_IP       => \&is_whitelisted,      # Is specified IP whitelisted? 
+           HELP                    => \&return_help,
+           RELOAD                  => \&reload,
+           SAVE_GREYLIST           => sub { save_greylist(); },
+           SHOW_GREYLISTED         => \&show_greylisted,
+           SHOW_VERIFIED           => \&show_verified,
+           SHOW_WHITELIST          => \&show_whitelist,
+           SHOW_OPTIN              => \&show_optin,          # Who has opted in?
+           STATS                   => \&dump_stats,
+           UPDATE                  => \&update_optins,       # Update user's optin's 
+);
+
+my $config = '/etc/greylistd.conf';
+
+# Get options, if specified
+unless (GetOptions(
+                   'config|cfg=s' => \$config,      # Override default config file
+                   'loglevel=i'   => \$loglevel,    # Log level
+                   'debug|d'      => \$debug,       # Run in debug mode
+                   'daemon!'      => \$daemon,      # --nodaemon also valid
+                   'help'         => \$help,        # Show help
+                   'version'      => \$show_version, # Display version and exit
+                   )) { 
+    system("/usr/bin/pod2text $0 | less -e");
+    exit; 
+}
+
+if ($show_version) {
+    print "$version\n";
+    exit;
+}
+
+# Shouldn't be any args left
+if (scalar(@ARGV) || $help) {
+    system("/usr/bin/pod2text $0 | less -e");
+    exit;
+}
+
+# Only root can run this
+die "Only root can start the Greylist Daemon.\n" if $<;
+
+unless (-r $config) { 
+    die "Cannot read configuration file $config\n";
+}
+
+read_config($config);           # Read the configuration file
+
+$0 = "greylistd";               # This is who I want to be known as
+    
+# Load up with the greylist from most recent run.
+load_greylist();
+
+# Open the PID file
+($pidfh, $pid) = open_pid_file($conf{pidfile});
+
+# Time to become a daemon
+if ($daemon) {
+    # Let's become a daemon
+    Proc::Daemon::Init() unless $ENV{BIND_FD};
+    umask 0117;
+    exit 1 if Proc::PID::File->running();  # Avoid multiples of us
+}
+else {
+    print "Running in the foreground ...\n";
+}
+
+# We know our PID now; write it to the pid file
+print $pidfh $$;
+close $pidfh;
+
+# Open the log so we can write to it now.
+open_log();
+
+write_log(LOG_DEBUG, "Configuration file directives:\n");
+foreach my $key (sort keys %conf) {
+    write_log(LOG_DEBUG, "$key", "=", ((ref($conf{$key}) eq 'HASH') ? (keys %{ $conf{$key}}) : $conf{$key}), "\n");
+}
+
+
+# Set up some signal handlers
+$SIG{TERM} = $SIG{INT} = sub { save_greylist(); write_log(LOG_NOTICE, "Received TERM/INT signal. Exiting\n"); exit 0; };
+$SIG{PIPE} = sub { die "PIPE" }; # Write to pipe with no readers
+$SIG{USR2} = \&open_log;         # USR2 will close/open the log
+
+# Reap child processes as they exit
+$SIG{CHLD} = sub { 
+    my $kid = -1; 
+    do { 
+        $kid = waitpid(-1, POSIX::WNOHANG); 
+    } 
+    until $kid == -1; 
+};
+
+POSIX::sigaction(&POSIX::SIGHUP, 
+                 POSIX::SigAction->new('reload', POSIX::SigSet->new(), &POSIX::SA_NODEFER));
+
+
+# Make inotify watch for changes in the included configuration files
+my $notifier = undef;           # watches and receives notices of file events (inotify)
+set_watches();
+$notifier->blocking(0);         # Don't wait if inotify's queue is empty
+
+my $listen;                     # Something to listen to ...
+
+# If we've been listening already, keep on/resume listening
+if (exists $ENV{BIND_FD} and $ENV{BIND_FD} =~ /^(\d+)$/) {
+    my $bind_fd = $1;
+    write_log(LOG_DEBUG, "Reusing fd($bind_fd)\n");
+    $listen = IO::Socket::UNIX->new();
+    $listen->fdopen($bind_fd, "r") or die "Socket: $!";
+}
+else {
+    unlink $conf{socket};
+    unless ($listen = IO::Socket::UNIX->new(
+             Local  => $conf{socket},
+             Listen => SOMAXCONN,
+                                            )) {
+        write_log(LOG_ERR, "Socket: $!\n");
+        die "Socket: $!";
+    }
+    
+    # Make the socket owned by configured user and group ... so that exim can
+    # access it. 
+    chown ( ((getpwnam($conf{eximuser}))[2]), ((getgrnam($conf{eximgroup}))[2]), $conf{socket}) 
+        || warn "chown of socket failed: $!";
+    chmod(0666, $conf{socket}) || warn "chmod of socket failed: $!";
+
+}
+
+# Make path to socket world-searchable. (Scarey!! ... but each user
+# needs access to it under the current cPanel implementation ...)
+my $sock_t = $conf{socket};
+while ($sock_t =~ m{^(.*)/[^/]*$}) {
+    $sock_t = $1;
+    unless (defined($sock_t) && length($sock_t)) {
+        last;                   # Don't mess with / directory
+    }
+    system("chmod o+x $sock_t");
+}
+
+# We're up!! Log it.
+write_log(LOG_NOTICE, "greylistd $version startup completed in " . tv_interval (\@start) . " seconds. Now Listening on $conf{socket}.\n");
+
+# Before starting, note when we need to write the greylist to the filesystem
+my $write_cache_time = time() + $conf{dumpfreq}; # dumpfreq seconds in the future
+
+my ($args, $conn, $req, $readbits, $rw, $timeleft, $nfound, $buffer, $msg);
+
+# This does all the real work:
+while (1) {
+    if (time() > $write_cache_time) {
+        # It's time to write the greylist and verified list out
+        
+        # Reset $write_cache_time to a time in the future
+        $write_cache_time = time() + $conf{dumpfreq};
+
+        # Save the greylist. TODO: Consider a different process for this
+        save_greylist(); 
+    }
+
+    eval {
+        $args = '';
+        $conn = $listen->accept() or die "Accept error: $!\n";
+        $req = $readbits = '';
+        vec($readbits, $conn->fileno, 1) = 1; # To tell select which descriptor ...
+        $timeleft = 0.5;
+        # Read the source IP, MAIL FROM: address, RCPT TO: address
+        while ($timeleft > 0) {
+            
+            ($nfound, $timeleft) = select($rw=$readbits, undef, undef, $timeleft);
+            $buffer = '';
+            if ($nfound != 0) { # Ah, something to do!!
+                sysread($conn, $buffer, 8192) or die "EOF on connection\n";
+            }
+            $req .= $buffer;
+            last if index($buffer, "\n") > 0;
+        }
+        die "Timed out on request\n" if $timeleft == 0;
+        
+        # Discard the first (hopefully only) newline encountered
+        # ... and whatever follows
+        $req =~ s/\n.*//s;      # Possibly a no op
+    };
+    if ($@) {                   # Eval error "at" (someplace above)
+        write_log(LOG_DEBUG, $@);    # Log it ...
+        $conn->shutdown(2) if $conn; 
+        next;
+    }
+    
+    # Get the information (sent by exim) from the socket
+    my ($cmd, $senderip, $fromaddr, $rcptaddr) = split (/\s+/, $req, 4);
+    $cmd ||= ''; $senderip ||= ''; $fromaddr ||= ''; $rcptaddr ||= '';
+    $msg = '';
+    if ($run{$cmd}) {          
+        # Before proceeding, see if any configuration include files have changed
+        # Construct a list of LHSs each file contributes to the conf
+        if ($notifier) {            # (Not true if Linux::Inotify2 ctor failed.
+            my @events = $notifier->read();
+            if (scalar(@events)) {
+                reread_update_files(@events);
+                set_watches();      # In case something was moved and inode changes???
+            }
+        }
+ 
+        # If we know about this command run it.
+        $stats{'02_Total_Requests_Since_Restart'}++;
+        write_log(LOG_DEBUG, "Running command [$req]\n");
+        $args = lc("$senderip $fromaddr $rcptaddr");
+        $msg = &{$run{$cmd}}($args);
+    } else {                    # 
+        write_log(LOG_ERR, "Unknown command [$req]\n");
+    }
+    
+    eval {
+        $timeleft = 0.5;
+        $buffer = 0;
+        if ($msg) {
+            do {
+                ($nfound, $timeleft) = select(undef, $rw=$readbits, undef, $timeleft);
+                if ($nfound != 0) {
+                    $buffer += syswrite($conn, $msg, length($msg));
+                }
+            } until ($timeleft == 0 or $buffer == length($msg));
+        }
+        $conn->shutdown(2);
+    };
+}
+
+######################################################
+# ;;add_optins
+# Read file listing--one per line--a domain name or email address
+#
+sub add_optins {
+    my ($fname) = @_;
+
+    my $fh = new IO::File "< $fname";
+    unless (defined $fh) { 
+        write_log(LOG_ERR, "Can't open optin file $fname: $!\n");
+        return;
+    }
+
+    # Who is the cpanel user that requested these optins?
+    my ($cpanel_user) = $fname =~ m{/([^/]+)$};
+    unless (defined($cpanel_user) && length($cpanel_user)) {
+        write_log(LOG_ERR, "ERROR add_optins: Cannot identify cpanel user from"
+                  . " file named $fname. No greylisting will occur for domains"
+                  . " or addresses in this file.\n");
+        return;
+    }                                
+   
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ m/^\s*\#|^\s*$/) {
+            next;               # Skip comment/blank lines
+        }
+        
+        # Eliminate comments
+        my ($dom_addr) = $line =~ m/^([^#]+)(?:\#.*)?/;
+
+        if (index($dom_addr, '@') == -1) {
+            # No @ sign; this is a domain
+            $optin_rcpt_domain{"$dom_addr"} = $cpanel_user;
+            $stats{'10_Total_Optin_Recipient_Domains'}++; # Increment statistics
+        }
+        else {
+            # Has @ sign; IS an email address
+            $optin_rcpt_addr{"$dom_addr"} = $cpanel_user;
+            $stats{'09_Total_Optin_Recipient_Addresses'}++; # Increment statistics
+        }
+    }
+
+    close($fh);
+    return;
+}
+
+######################################################
+# ;;add_whitelist
+#
+#
+sub add_whitelist {
+    my ($fname) = @_;
+    
+    my $fh = new IO::File "< $fname";
+    unless (defined $fh) { 
+        write_log(LOG_ERR, "Can't open whitelist file $fname: $!\n");
+        return;
+    }
+    
+    while (my $line = <$fh>) {
+        chomp $line;
+        if ($line =~ m/^\s*\#|^\s*$/) {
+            next;               # Skip comment/blank lines
+        }
+
+        # Get each specification (after removing comments)
+        ($line) = $line =~ m/^([^#]+)(?:\#.*)?/;
+        pos($line) = 0;  # Start matching at the beginning
+        while ($line =~ m/\G\s*(\S+)/g) {
+            whitelist_net($1, \%ip_whitelist);
+            $stats{'08_Total_Relay_Server_IP_Whitelist_Entries'}++; # Increment stats
+        }
+    }
+    
+    close($fh);
+    return;
+}
+
+#####################################################
+# ;;backup_file
+#
+# B A C K U P    F I L E
+#
+sub backup_file {
+    my ($fname) = @_;
+
+    unless (defined($fname) && length ($fname)) {
+        # Nothing to work with (no file name)
+        return;                 # Return, doing nothing
+    }
+
+    # Back up the file if it contains anything
+    if (-s "$fname") {
+        copy("$fname", "$fname.bak");
+    }
+
+    return;
+}
+
+#####################################################################
+# ;;is_deferred
+# Returns 'yes' if this delivery should be deferred.
+# Returns 'no' if shouldn't be deferred
+# 
+sub is_deferred {
+    my ($relayip, $fromaddr, $toaddr) = split(" ", $_[0]);
+    my $smtp_status = 'yes';        # Assume is deferred
+    my $log_msg = '';
+
+    my ($touser, $todomain) = split('@', $toaddr);
+
+    $stats{'03_Total_Greylist_Checks_Since_Restart'}++;
+
+    # Don't greylist unless the RCPT domain or email address has opted in
+    if (!($optins_wildcarded
+          || defined($optin_rcpt_domain{$todomain}) 
+          || defined($optin_rcpt_addr{"${touser}\@${todomain}"}))) {
+        $smtp_status = 'no';       # no|0|false = Not Deferred
+        $stats{'06_Total_Emails_to_Non_Optin_Addresses'}++;
+        write_log(LOG_WHITE_OPT, "ACCEPT mail from $relayip address $fromaddr, to ${touser}\@${todomain} (hasn't opted in)\n");
+    }
+
+    # Is the *IP* in the whitelisted IP list?
+    if (is_ip_in_list($relayip,\%ip_whitelist)) {
+        if ($smtp_status eq 'yes') { # If we haven't already logged acceptance (above) do it now
+            write_log(LOG_WHITE_OPT, "ACCEPT mail from $relayip address $fromaddr, to ${touser}\@${todomain} (IP whitelisted)\n");
+        }
+        $smtp_status = 'no';       # Not Deferred
+        $stats{'07_Total_Emails_from_Whitelisted_IPs'}++;
+    }
+
+    unless ($smtp_status eq 'yes') { # Unless this IS deferred (so far) ...
+        $stats{'05_Total_Emails_Accepted_Since_Restart'}++;
+        return $smtp_status;    # Not deterred
+    }
+
+    # Above tests were with in-memory hashes from the config file.
+    # Now we need to use MySQL or some other dynamic data structure
+    # We're still here because the incoming email didn't
+    # match any whitelist or not in optin list ... so here we go.
+
+    # Version 1.2: use the class C network address of the $relayip
+    my ($class_c) = $relayip =~ m/^\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}/; # First 3 octets
+    $class_c .= '.0';
+
+    my $gl_key = "${class_c}__${fromaddr}__${toaddr}";
+    my $curtime = time();       # We're interested only in whole seconds since epoch
+
+    ###############################################################
+    # I S   V E R I F I E D ?
+    if (defined($greylist{$gl_key}) && defined($greylist{$gl_key}{gooduntil})) {
+        if ($greylist{$gl_key}{gooduntil} > $curtime) {
+            # Still a verified user
+            # Update the entry's time to extend its verified period
+            $greylist{$gl_key}{gooduntil} = $curtime + $conf{vfy_duration};
+            $stats{'05_Total_Emails_Accepted_Since_Restart'}++;
+            write_log(LOG_VERIFIED, "ACCEPT mail from $relayip address $fromaddr, to ${toaddr} (still verified)\n");
+            return 'no';           # Not deferred (i.e., "accept")
+        }
+        else {
+            # Still here; it's been too long since previous delivery
+            delete $greylist{$gl_key}; # Remove "verified" status
+            write_log(LOG_VERIFIED, "Mail from $relayip address $fromaddr, to ${toaddr} removed from verified list (verification expired). Continuing.\n");
+        }
+    }
+    ############################################################################
+    # G R E Y L I S T   (here to end of function)
+    # If we get this far, the email is neither whitelisted or verified
+    # Let's check the greylist
+    if (defined($greylist{$gl_key})) {
+        # Above might be undefined because this is never-before-seen mail,
+        # or because we deleted the entry about 5 lines earlier.
+        if (($curtime > $greylist{$gl_key}{tryafter})
+            && ($curtime < $greylist{$gl_key}{tryby})) {
+            # This second try was inside the window! Proceed
+            # Add to verified users
+            $greylist{$gl_key}{gooduntil} = $curtime + $conf{vfy_duration};
+            $stats{'05_Total_Emails_Accepted_Since_Restart'}++;
+            $stats{'11_Total_Triplets_Verified_Since_Restart'}++;
+            write_log(LOG_DEFER, "ACCEPT mail from $relayip address $fromaddr, to ${toaddr} (just verified)\n");
+            return 'no';           # Not deferred ("accept")
+        }
+        else {
+            # Email has knocked 2nd time, but to soon or too late
+            # Refresh deferred entry ... as if this is the first knock
+            $greylist{$gl_key}{tryafter} = $curtime + $conf{second_try_min};
+            $greylist{$gl_key}{tryby} = $curtime + $conf{second_try_max};
+            write_log(LOG_DEFER, "DEFER mail from $relayip address $fromaddr, to ${toaddr} (2nd attempt too soon or too late)\n");
+            $smtp_status = 'yes';   #"defer"
+        }
+    }
+
+    else {
+        # Not in greylist. Treat this as the first knock
+        # Add to greylist.
+        $greylist{$gl_key}{tryafter} = $curtime + $conf{second_try_min};
+        $greylist{$gl_key}{tryby} = $curtime + $conf{second_try_max};
+        write_log(LOG_DEFER, "DEFER mail from $relayip address $fromaddr, to ${toaddr} (1st attempt)\n");
+        $smtp_status = 'yes';       # "defer"
+    }
+
+    # connect-from-IP, mail-from and rcpt-to.
+    $stats{'12_Total_Triplets_Greylisted_Since_Restart'}++;
+    $stats{'04_Total_Emails_Deferred_Since_Restart'}++;
+
+    return $smtp_status;
+}
+
+##############################################
+# ;;is_ip_in_list
+# Passed an ip address and a reference to a hash of hashes representing
+# CIDR-specified networks, indicate if this address is part of the 
+# hash
+# 
+sub is_ip_in_list {
+    my ($address, $nethash_ref) = @_;
+    unless (defined($address) && length($address)) {
+        return 1;               # Immune, I guess
+    }
+
+    if ($address =~ m/^(\d+)\.\d+\.\d+\.\d+$/) {
+        my $key = $1;
+        # Check the whitelist to see if this IP address is one of
+        # the addresses that are immune from greylisting
+        if ($$nethash_ref{$key}) { # Possibility of a match--1st octet matches
+            foreach my $entry (keys %{ $$nethash_ref{$key} } ) {
+                # Pass three args to net_contains_ip:
+                # The IP address in the whitelist, the mask in the whitelist
+                # and the $address we want to determine whether or not it is
+                # whitelisted
+                if (net_contains_ip($entry, $$nethash_ref{$key}{$entry}, $address)) {
+                    write_log(LOG_DEBUG, "Whitelisted: IP address $address will not be checked\n");
+                    return 1;       # This IP is listed.
+                }
+            }
+        }
+    }
+    else {
+        write_log(LOG_ERR, "is_ip_in_list: Invalid IP address $address\n");
+    }
+
+
+    return 0;                  # Not skipped
+}
+
+#####################################################################
+# ;;is_whitelisted
+# Is specified IP address whitelisted:
+# Returns 'yes' if IP is whitelisted
+# Returns 'no' if IP isn't whitelisted
+# 
+sub is_whitelisted {
+    my $relayip = $_[0];
+    chomp $relayip;
+    my ($ip) = $relayip =~ m/^[^\d]*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^\d]*/;
+    unless (defined($ip) && length($ip)) {
+        return 'no';            # Not whitelisted--in fact, not an IP address!
+    }
+    
+    if (is_ip_in_list($ip,\%ip_whitelist)) {
+        return 'yes';           # Whitelisted!!
+    }
+
+    return 'no';                # Not whitelisted
+}
+
+############################################################
+# ;;load_greylist
+# Read saved greylist from file where it was saved earlier.
+sub load_greylist {
+    my $retcode = 0;            # OK
+    unless (open(GL, '<', $conf{dumpfile})) {
+        $retcode = 4;           # Failed to open
+        return $retcode;
+    }
+    
+    my @row;
+  FILELINE:
+    while (<GL>) {
+        chomp;
+        undef(@row);
+        @row = split /\t/;
+
+        # Make sure all 6 elements are defined
+        for (my $i = 0; $i <= 5; $i++) {
+            # Skip this line if anything is undefined
+            next FILELINE unless defined($row[$i]);
+        }
+
+        # Version 1.2: Convert IP addresses in to class C network
+        my ($class_c) = $row[0] =~  m/^\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}/; # First 3 octets
+        
+        $class_c .= '.0';
+
+        my $gl_key = lc("${class_c}__$row[1]__$row[2]");
+
+        $greylist{$gl_key}{tryafter}  = $row[3];
+        $greylist{$gl_key}{tryby}     = $row[4];
+        $greylist{$gl_key}{gooduntil} = $row[5];
+    }
+    close GL;
+
+    # Eliminate expired entries
+    purge_expired();
+    return;
+}
+
+#############################################
+# ;;net_contains_ip
+# Does the network (specified in arg1 and modified
+# by the mask in arg2) contain the
+# address (specified in arg3);
+sub net_contains_ip {
+    my ($network, $mask, $address) = @_;
+    unless(defined($address) && length($address)) {
+        return 0;               # boolean false
+    }
+
+    # Work with the network value
+    my $netnum = 0;
+    # If "network" is a single address, the /n suffix can be omitted
+    if ($network =~ m/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/) {
+        $netnum = ($1 << 24) + ($2 << 16) + ($3 << 8) + $4;
+    }
+    else {
+        # Malformed network specification
+        return 0;               # boolean false
+    }
+
+    # Now work with the specific address
+    my $addrnum = 0;            # Address as a 32-bit number
+    if ($address =~ m/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/) {
+        $addrnum = ($1 << 24) + ($2 << 16) + ($3 << 8) + $4; 
+        if ($addrnum > MAX_32BIT) {
+            warn "net_contains_ip: Single IP address too large\n";
+            return 0;           # boolean false
+        }
+    }
+    else {
+        warn "net_contains_ip: Invalid single address $address\n";
+        return 0;               # boolean false
+    }
+
+    if (network_of($addrnum, $mask) == network_of($netnum, $mask)) {
+        return 1;               # YES, NETWORK CONTAINS IP ADDR
+    }
+
+    return 0;
+}
+
+########################################
+# Passed a 32-bit number representing an IPv4 address, and
+# a positive integer less than 33, 
+# return a 32-bit integer representing the network address
+# Question: What about big-endian/little-endian? Does it
+# just *happen* to work with little-endian?
+sub network_of {
+    my ($address, $mask) = @_;
+    if (! defined($mask)) { return 0;}
+
+    elsif ($mask < 1 || $mask > 32) { return 0;}
+
+    elsif ($mask == 32) { return $address; }
+    
+    else {
+        my $netmask = (2 ** $mask) -1;
+
+        $netmask <<= (32 - $mask);
+
+        # Is the address in the network?
+        my $network = $address & $netmask;
+        return $network;
+    }
+}
+
+##########################################
+# ;;open_log
+sub open_log {
+    $logfd = IO::File->new($conf{log_file}, ">>", 0600) or print "Error opening log file $conf{log_file}\n";
+    $logfd->autoflush(1);
+}
+
+END {
+  write_log(LOG_DEBUG, "Exiting [in END block] ...\n");
+  unlink $conf{pidfile} if (defined($pid) && ($$ == $pid));
+  exit 0;
+}
+
+#####################################################
+# ;;open_pid_file
+#
+sub open_pid_file {
+    my $pidf = shift;
+    my $pid = -1;
+    if (-e $pidf) {             # Hmmm... orphaned PID file
+        my $fh = IO::File->new($pidf) || return;
+        $pid = <$fh>;        # What's the "old" PID?
+        if (defined($pid)) {
+            chomp $pid;
+            if (kill 0 => $pid) {   # Process with this PID is running!
+                die "Server already running with PID $pid.\n";
+            }
+            print "Removing PID file $pidf for defunct server process $pid.\n";
+        }
+            
+        die "Can't unlink PID file $pidf.\n" unless -w $pidf && unlink $pidf;
+    }
+
+    # We're good to go. The orphaned PID file has no running process,
+    # and we nuked that file
+    return (IO::File->new($pidf,O_WRONLY|O_CREAT|O_EXCL, 0644), $pid)
+        or die "Can't create PID file $pidf: $!\n";
+}
+
+#####################################################
+# ;;purge_expired
+# Purge expired entries from the database
+sub purge_expired {
+    my $curtime = time();
+    foreach my $entry (keys %greylist) {
+        my @key_elt =  split /__/, $entry;
+        # Check if verification has expired
+        if (defined($greylist{$entry}{gooduntil}) && ($greylist{$entry}{gooduntil} > 0)) {
+            if ($greylist{$entry}{gooduntil} < $curtime) {
+                # This is a stale verified entry. Delete it
+                delete $greylist{$entry};
+            }
+            # Otherwise the entry is still verified
+            # Keep looking
+        }
+        # See if deferred entry has expired. If so, delete it
+        elsif ($greylist{$entry}{tryby} < $curtime) {
+            # Waited too long for second knock
+            delete $greylist{$entry};
+        }
+    }
+}
+
+#####################################################
+# ;;reread_update_files
+# Re-read the external configuration files that have
+# whitelists and optin lists (using the information
+# from Linux::Inotify2)
+# FIXME: Do this more succinctly ...
+#
+sub reread_update_files {
+    my @events = @_;            # Returned by inotify
+    my %need_reread_optin = (); # Optin files that have changed
+    my $need_reread_whitelist = 0; # Boolean indicating ALL whitelist files need rereading
+  EVENT:
+    foreach my $event (@events) {
+        # Is this a whitelist file?
+        foreach my $ip_file (keys %{ $conf{'ip_whitelist_file'} }) {
+            if ($event->fullname eq $ip_file) {
+                if ($event->IN_MODIFY || $event->IN_CLOSE_WRITE
+                    || $event->IN_DELETE_SELF || $event->IN_MOVE_SELF) {
+                    $need_reread_whitelist = 1;
+                }
+                next EVENT;     # This was a whitelist event. Move to next event
+            }
+        }
+
+        # We're here implies that the event wasn't a change to an IP whitelist file
+        # It's someone's optin file:
+        unless ($optins_wildcarded && defined($conf{optin_dir})) {
+            if ($event->fullname =~ m/^$conf{optin_dir}/) {
+                $need_reread_optin{$event->fullname} = 1 if $event->IN_CREATE
+                    || $event->IN_MOVED_TO
+                    || $event->IN_MODIFY 
+                    || $event->IN_CLOSE_WRITE;
+            }
+        }
+
+    }
+
+    # Refresh optin/whitelists as appropriate
+    if ($need_reread_whitelist) {
+        # Reread all IP whitelists from files
+        %ip_whitelist = ();     # Clear IP whitelists first
+        foreach my $whitelist_file (keys %{ $conf{ip_whitelist_file} }) {
+            add_whitelist($whitelist_file);
+        }
+        write_log(LOG_WHITE_OPT, "Reread modified IP whitelist file(s) because change detected.\n");
+    }
+
+    # If 1+ user optin files changed, then 
+    #   1. clear that user's entries from %optin_rcpt_domain and %optin_rcpt_addr
+    #   2. reread entries from /etc/greylist/<cpanel_user>
+    foreach my $changed_file (keys %need_reread_optin) {
+        my ($user) = $changed_file =~ m{/([^/]+)$};
+        if (defined($user) && length($user)) {                                  
+            # Remove user's optin entries from %optin_rcpt_domain and %optin_rcpt_addr
+            # NOTE: Why not merge $optin_rcpt_domain and %optin_rcpt_addr???
+            foreach my $key (keys %optin_rcpt_domain) { # Is this efficient/safe?
+                if ($optin_rcpt_domain{$key} eq $user) {
+                    delete $optin_rcpt_domain{$key}; 
+                }
+            }
+
+            foreach my $key (keys %optin_rcpt_addr) { # Is this efficient?
+                if ($optin_rcpt_addr{$key} eq $user) {
+                    delete $optin_rcpt_addr{$key}; 
+                }
+            }
+
+            # Now reread the file
+            add_optins("$conf{optin_dir}/$user");
+            write_log(LOG_WHITE_OPT, "Reread changed optin file $conf{optin_dir}/$user.\n");
+        }
+    }
+}
+
+#####################################################
+# ;;read_config
+# Read the configuration file
+# 
+
+sub read_config {
+    my ($cfgname) = @_;
+
+    $cfgname =~ s/\s+//g;
+    
+    my $fh = new IO::File "< $cfgname";
+    unless (defined $fh) { 
+        die "Can't open configuration file $cfgname: $!\n"; 
+    }
+    
+    while (<$fh>) {
+        chomp;
+        if ((m/^\s*\#/) || (m/^\s*$/)) {
+            next;               # Skip comment/blank lines
+        }
+        
+        # These lines aren't comments; they all look like: <token> = <stuff-to-#>)
+        if (m/^\s*(\S+)\s*=\s*([^\#]+)[\#]?.*$/) {
+            my $lhs = lc($1);   # meaningful stuff before =
+            my $rhs = $2;       # Meaningful stuff after = (up to #)
+            if ($rhs =~ m/^(.*?)\s*$/) {
+                $rhs = $1;      # Trim trailing whitespace
+            }
+            
+            # Check for unknown directives on LHS
+            unless (exists($conf{$lhs})) {
+                write_log(LOG_ERR, "Unrecognized directive in $cfgname: $_ (ignoring).\n");
+                next;
+            }
+            
+            # Handle IP whitelists
+            if ($lhs =~ m/^ip_whitelist_file$/i) {
+                # Allow multiple space/comma-separated file names on RHS
+                my @ipfiles = split /[\s,]+/, $rhs;
+                # Remember what file is supplying this directive.
+                foreach my $oneipf (@ipfiles) {
+                    $conf{'ip_whitelist_file'}{$oneipf} = 1;
+                    add_whitelist($oneipf); # Add contents of one whitelist file
+                }
+            }
+            
+            elsif ($lhs =~ m/^optin_dir$/) {
+                $conf{$lhs} = "$rhs";
+                # Handle special wildcard value * (opts in all domains)
+                if ($rhs eq '*') {
+                    $optin_rcpt_domain{'*'} = 1;
+                    $optin_rcpt_addr{'*'} = 1;
+                    $optins_wildcarded = 1;
+                }
+                else {
+                    unless (-d $rhs) { # Create the directory if it doesn't exist
+                        unless (mkdir $rhs) {
+                            write_log(LOG_ERR, "ERROR: Cannot find/create optin directory $rhs!!"
+                                      . " No greylisting will occur because no one can opt in!!\n");
+                            next; # Don't mess with this config line further
+                        }
+                        chmod 0700, "$rhs"; # Probably not necessary?
+                    }
+                    unless (opendir(OPTIN_DIR, $rhs)) {
+                            write_log(LOG_ERR, "ERROR: Cannot open the optin directory $rhs!!"
+                                      . " No greylisting will occur because no one can opt in!!\n");
+                            next;
+                    }
+                    my @optin_files = grep !/^\.\.?\z/, readdir OPTIN_DIR;
+                    foreach my $onefile (@optin_files) {
+                        add_optins("$rhs/$onefile");
+                    }
+                }
+            }
+            
+            elsif ($rhs =~ m/^(\d+)([smhdw])$/i) { # m is minute (not month)
+                # Numberid RHS with s,m,h,d,w suffix (time units)
+                my $numeric = $1;
+                my $qualifier = lc($2);
+                if    ($qualifier eq 'w') { $rhs = $numeric * WEEKSECS; }
+                elsif ($qualifier eq 'd') { $rhs = $numeric * DAYSECS; }
+                elsif ($qualifier eq 'h') { $rhs = $numeric * HOURSECS; }
+                elsif ($qualifier eq 'm') { $rhs = $numeric * MINSECS; }
+                elsif ($qualifier eq 's') { $rhs = $numeric; }                
+                $conf{lc($lhs)} = "$rhs";
+            }
+            else {
+                $conf{$lhs} = "$rhs";
+            }
+        }
+    }
+    
+    close($fh);
+    
+    # If a command option overrode the loglevel in the config file,
+    # let it override now.
+    
+    if (defined($loglevel) && ($loglevel > -1)) {
+        $conf{log_level} = $loglevel;
+    }
+}
+
+###########################################################
+# ;;re_read_greylist
+# Clear the greylist structure and re-read whatever is in the
+# dump file.
+sub re_read_greylist() {
+    write_log(LOG_NOTICE, "SIG_HUP: Re-reading greylisted/verified info from $conf{dumpfile} ...\n");
+
+    # FIXME: This should probably have a mutex???
+
+    %greylist = ();                # Clear the greylist
+    load_greylist();                # Reload it
+
+    # FIXME: Release mutex ???
+
+    write_log(LOG_NOTICE, "Re-reading of $conf{dumpfile} complete.\n");
+    return;
+}
+
+###################################################################
+# ;;reload
+# Asked to Hang up. Let's reload (like rbld and infod do ...)
+#
+sub reload {
+    write_log(LOG_NOTICE, "Reloading greylistd (possibly in response to SIGHUP).\n");
+    save_greylist();            # Hang on!!!
+    exit if fork;
+    sleep 2;
+    exec "$runpath" or die "exec: $!";
+}
+
+
+#####################################################################
+# ;;return_help
+# Show the commands we accept
+# 
+sub return_help {
+    my @cmds = (
+                'IS_DEFERRED <relayip> <fromaddr> <touser> <todomain>',
+                'CLEAR_GREYLIST              (Clear in-memory greylist)',
+                'HELP                        (Return commands socket accepts)',
+                'LOAD_GREYLIST               (Load the greylist from disk)',
+                'LOGLEVEL <0|1|2|3|4|5|6|7>  (Set the logging level)',
+                'SAVE_GREYLIST               (Write greylist to disk)',
+                'SHOW_GREYLISTED             (Show greylisted [deferred] entries)',
+                'SHOW_OPTIN                  (Show domains/addresses that have opted in)',
+                'SHOW_VERIFIED               (Show verified list entries)',
+                'SHOW_WHITELIST              (Show whitelisted IP addresses)',
+                'STATS                       (Show statistics)',
+                );
+
+    foreach my $element (@cmds) {
+        $conn->print("$element\n");
+    }
+
+    $conn->print(<<'_SIGINFO_');
+
+Signals (sent with kill command):
+
+   kill -TERM <pid>
+   kill -INT <pid>
+     Shut down greylistd after saving data to disk.
+
+   kill -USR2 <pid>
+     Close and then open the log file.
+
+   kill -HUP <pid>
+     Clear in-memory greylist, then restart greylistd.
+
+_SIGINFO_
+    return;
+}
+
+############################################################
+# ;;save_greylist
+# Write the greylisted criteria to a file for future restart
+sub save_greylist {
+    backup_file($conf{dumpfile});
+
+    my $retcode = 0;            # OK
+    unless (open(GL, '>', $conf{dumpfile})) {
+        $retcode = 4;           # Failed to open
+        return $retcode;
+    }
+
+    write_log(LOG_INFO, "Writing greylist contents to $conf{dumpfile} ...\n");
+    purge_expired();                # Purge expired entries from list
+    foreach my $entry (keys %greylist) {
+        my @key_elt =  split /__/, $entry;
+
+        # Still here: Then it's worth saving
+        print GL "$key_elt[0]\t"
+            . "$key_elt[1]\t"
+            . "$key_elt[2]\t"
+            . "$greylist{$entry}{tryafter}\t"
+            . "$greylist{$entry}{tryby}\t"
+            . (defined($greylist{$entry}{gooduntil}) ? "$greylist{$entry}{gooduntil}\n" : "0\n");
+    }
+    close GL;
+    return $retcode;
+}
+
+############################################################
+# ;;set_watches
+# Set inotify watches on the whitelist file(s) and optin directory
+# (probably /etc/greylist) specified in the config file. If they
+# change, we need to re-read.
+# NOTE: If the config file uses * (asterisk) as the name of the
+# optin_dir, DO NOT set watches on the optin_dir.
+sub set_watches {
+    # Create notifier (if we haven't already)
+    unless (defined $notifier) {
+        $notifier = new Linux::Inotify2;
+        unless ($notifier) {
+            write_log(LOG_ERR, "set_watches: Unable to create inotify notifier!! $!\n");
+            return;
+        }
+    }
+
+    # Start with the IP whitelist file(s)
+    my @files2watch = keys %{ $conf{'ip_whitelist_file'} };
+    # Add watches for each IP whitelist file
+    foreach my $fname (@files2watch) {
+        # Create the file if it doesn't exist
+        unless(-e $fname) {
+            open(F,"$fname") && close F; # (Very touching ...)
+        }
+        $notifier->watch($fname, IN_MODIFY|IN_DELETE_SELF|IN_CLOSE_WRITE|IN_MOVE_SELF);
+    }
+
+    # Now set a watch on the optin directory (unless wildcarded)
+    if (!$optins_wildcarded) {
+        unless (-d $conf{'optin_dir'}) {
+            # Create the notify directory if it doesn't exist
+            unless (mkdir $conf{'optin_notify_dir'}) {
+                write_log(LOG_ERR, "set_watches: Unable to access/create"
+                          . " optin_notify_dir $conf{'optin_notify_dir'}."
+                          . " Optin's will go unnoticed!!\n");
+            }
+            chmod 0222, $conf{'optin_dir'}; # Maybe 0220 ???
+            # chown?
+        }
+        # Watch for changes in that directory
+        $notifier->watch($conf{'optin_dir'}, IN_CREATE|IN_MOVED_TO|IN_MODIFY|IN_DELETE_SELF|IN_CLOSE_WRITE|IN_MOVE_SELF);
+    }
+    
+    return;
+}
+
+#####################################################################
+# ;;show_greylisted
+# Show who is greylisted (i.e. those who have knocked only once)
+# Args: Any of TOSOCK NOHEADER BATCH [Minimal unique prefix OK]
+# Meaning: TOSOCK    Write results to socket
+#          NOHEADER  Omit header at start of output
+#          BATCH     Separate fields with tab character
+# 
+sub show_greylisted {
+    my @myargs = @_;
+    my $flattened = '';
+    my $tosock = 0;
+    my $show_headers = 1;         # Show headers by default
+    my $batch = 0;                # Don't separate fields with tab
+    my $want_count_only = 0;      # Internal request for the count of greylisted entries
+    if (scalar(@myargs)) {
+        $flattened = ' ' . join(' ', @myargs);
+        if ($flattened =~ m/ COUNT/) {
+            $want_count_only = 1; # Return the number if entries (only)
+        }
+        else {
+            if ($flattened =~ m/ n/i) { # Noheaders
+                $show_headers = 0;
+            }
+            if ($flattened =~ m/ t/i) { # Tosock
+                $tosock = 1;
+            }
+            if ($flattened =~ m/ b/i) { # Batch--tabs between fields
+                $batch = 1;
+            }
+        }
+    }
+
+    purge_expired();
+
+    my $total_entries = 0;
+    foreach my $entry (sort(keys %greylist)) {
+#    foreach my $entry ( map { $_->[0] }
+#                        sort { $a->[1] cmp $b->[1] }
+#                        map { [$_, (split /__/, $_, 2)[1]] }
+#                        keys(%greylist)) {
+       my ($relayip, $fromaddr, $toaddr) =  split /__/, $entry;
+        if (! (defined($greylist{$entry}{gooduntil}) && $greylist{$entry}{gooduntil})) {
+            # N.B. If "gooduntil" defined, then not in greylist ...
+            $total_entries++;
+            my $fromtime = (strftime("%F %T", localtime($greylist{$entry}{tryafter})));
+            my $totime = (strftime("%F %T", localtime($greylist{$entry}{tryby})));
+
+            # We'll optionally print headers before the first entry:
+            if ($total_entries == 1) {
+                if ($tosock && $show_headers) {
+                    if ($batch) {
+                        $conn->print("Relay IP\tFrom\tTo\tRetry between\tAnd\n");
+                    }
+                    else { 
+                        $conn->print("Current time: " . strftime("%F %T", localtime()) . "\n");
+                        $conn->print("Relay IP:         From:                               To:                            Retry between:      And:\n");
+                        $conn->print('-' x 124, "\n");
+                    }
+                }
+            }
+
+            if ($tosock) {
+                if ($batch) {
+                    $conn->print("$relayip/24\t$fromaddr\t$toaddr\t$fromtime\t$totime\n");
+                }
+                else {
+                    my $class_c = "$relayip/24";
+                    $conn->print(sprintf("%-17s %-35s %-30s %19s %19s\n", 
+                                         $class_c, $fromaddr, $toaddr, $fromtime, $totime));
+                }
+            }
+
+            write_log(LOG_DEBUG, "Relay IP: $relayip/24; From: $fromaddr; To: $toaddr; Retry between: $fromtime and $totime\n");
+        }
+    }
+
+    if ($tosock && $show_headers) {
+        if ($total_entries && !$batch) {
+            $conn->print('-' x 124, "\n");
+        }
+        $conn->print("Total greylisted (deferred) entries: $total_entries\n");
+    }
+
+    if ($want_count_only) {
+        return $total_entries;
+    }
+    else {
+        return;
+    }
+}
+
+#####################################################################
+# ;;show_verified
+# Show who is verified (i.e. those who have knocked twice and are no longer greylisted)
+# Args: Any of TOSOCK NOHEADER BATCH [Minimal unique prefix OK]
+# Meaning: TOSOCK    Write results to socket
+#          NOHEADER  Omit header at start of output
+#          BATCH     Separate fields with tab character
+sub show_verified {
+    my @myargs = @_;
+    my $flattened = '';
+    my $tosock = 0;
+    my $show_headers = 1;         # Show headers by default
+    my $batch = 0;                # Don't separate fields with tab
+    my $want_count_only = 0;      # Internal request for the count of greylisted entries
+    if (scalar(@myargs)) {
+        $flattened = ' ' . join(' ', @myargs);
+        if ($flattened =~ m/ COUNT/) {
+            $want_count_only = 1; # Return the number if entries (only)
+        }
+        else { 
+            if ($flattened =~ m/ n/i) { # Noheaders
+                $show_headers = 0;
+            }
+            if ($flattened =~ m/ t/i) { # Tosock
+                $tosock = 1;
+            }
+            if ($flattened =~ m/ b/i) { # Batch--tabs between fields
+                $batch = 1;
+            }
+        }
+    }
+
+    purge_expired();
+
+    my $total_entries = 0;
+    foreach my $entry (sort(keys %greylist)) {
+        my ($relayip, $fromaddr, $toaddr) =  split /__/, $entry;
+        if (defined($greylist{$entry}{gooduntil}) && $greylist{$entry}{gooduntil}) {
+            $total_entries++;
+            my $expiretime = (strftime("%F %T", localtime($greylist{$entry}{gooduntil})));
+
+            if ($total_entries == 1) { # This is the first entry. Optionally precede it with headers
+                if ($tosock && $show_headers) {
+                    if ($batch) {
+                        $conn->print("Relay IP\tFrom\tTo\tVerified until\n");
+                    }
+                    else {
+                        $conn->print("Current time: " . strftime("%F %T", localtime()) . "\n");
+                        $conn->print("Relay IP:         From:                               To:                            Verified until:\n");
+                        $conn->print('-' x 104, "\n");
+                    }
+                }
+            }
+
+            if ($tosock) {
+                if ($batch) {
+                    $conn->print("$relayip/24\t$fromaddr\t$toaddr\t$expiretime\n");
+                }
+                else {
+                    my $class_c = "$relayip/24";
+                    $conn->print(sprintf("%-17s %-35s %-30s %19s\n", 
+                                         $class_c, $fromaddr, $toaddr, $expiretime));
+                }
+            }
+
+            write_log(LOG_DEBUG, "Relay IP: $relayip/24; From: $fromaddr; To: $toaddr; Verified until: $expiretime\n");
+        }
+    }
+
+    if ($tosock && $show_headers) {
+        if ($total_entries && !$batch) {
+            $conn->print('-' x 104, "\n");
+        }
+        $conn->print("Total verified entries: $total_entries\n");
+    }
+    if ($want_count_only) {
+        return $total_entries;
+    }
+    else {
+        return;
+    }
+}
+
+#####################################################################
+# ;;show_optin
+# Dump the recipient email addresses/domains that have opted in to 
+# greylisting.  Write output to the LOG and/or the socket
+#
+# Args: Any one of BOTH DOMAIN ADDR [Minimal unique prefix OK]
+# Meaning: BOTH:   Both recipient domains and complete e-mail 
+#                  addresses that have opted in.
+#          DOMAIN: Recipient domains that have opted in.
+#          ADDR:   Recipient email addresses that have opted in.
+# 
+sub show_optin {
+    my @myargs = @_;
+    my $flattened = '';
+    my $tosock = 0;
+    my $show_headers = 1;       # Show headers by default
+    my $batch = 0;              # Single field only--meaningless
+    my $domain = 0;
+    my $addr = 0;
+    if (scalar(@myargs)) {
+        $flattened = ' ' . join(' ', @myargs);
+        if ($flattened =~ m/ n/i)  { $show_headers = 0; } # Noheaders
+        if ($flattened =~ m/ t/i)  { $tosock = 1; }       # Tosock
+        if ($flattened =~ m/ b/i)  { $batch = 1;  }       # Batch--tabs between fields
+        if ($flattened =~ m/ d/i)  { $domain = 1; }       # Domain
+        if ($flattened =~ m/ a/i) { $addr = 1; }          # ADdr
+    }
+
+    unless ($domain + $addr) {
+        # No optin types specified; return both
+        $domain = 1; $addr = 1;
+    }
+
+    # First, handle wildcarded addresses or domains
+    if ($optins_wildcarded) {
+        if ($tosock) {
+            $conn->print("All recipient addresses/domains have opted in (wildcard * in the configuration file).\n");
+        }
+        write_log(LOG_DEBUG, "All recipient addresses/domains have opted in (wildcard * in the configuration file).\n");
+        return;
+    }
+
+    my $total_entries = 0;
+    my (@a_fields, @b_fields);
+
+    # Show the opt-in recipient domains
+    if ($domain) {
+        if ($show_headers) {
+            if ($tosock) {
+                $conn->print("Recipient domains that have opted in:\n");
+            }
+            write_log(LOG_DEBUG, "Recipient domains that have opted in:\n");
+        }
+
+        if (scalar(keys(%optin_rcpt_domain))) {
+
+            $total_entries += scalar(keys(%optin_rcpt_domain));
+
+            foreach my $domainkey (sort {$a cmp $b} keys %optin_rcpt_domain) {
+                # Print out a list of sorted recipient domains
+                if ($tosock) {
+                    $conn->print("$domainkey\n"); 
+                }
+
+                write_log(LOG_DEBUG, "$domainkey\n");
+            }
+        }
+        $conn->print("\n");
+    }
+
+    # Show the recipient addresses
+    if ($addr) {
+        if ($show_headers) {
+            if ($tosock) {
+                $conn->print("Recipient addresses that have opted in:\n");
+            }
+
+            write_log(LOG_DEBUG, "Recipient addresses that have opted in:\n");
+        }
+
+        if (scalar(keys(%optin_rcpt_addr))) {
+
+            $total_entries += scalar(keys(%optin_rcpt_addr));
+
+            foreach my $addrkey (sort {$a cmp $b} keys %optin_rcpt_addr) {
+                # Print out a list of sorted recipient addresses
+                if ($tosock) {
+                    $conn->print("$addrkey\n"); 
+                }
+                
+                write_log(LOG_DEBUG, "$addrkey\n");
+            }
+        }
+        $conn->print("\n");
+    }
+
+    if ($tosock && $show_headers) {
+        $conn->print("Total optin entries: $total_entries\n");
+    }
+
+    return;
+}
+
+#####################################################################
+# ;;show_whitelist
+# Dump the whitelisted IP addresses of relay (incoming connecting) email
+# servers.
+# 
+sub show_whitelist {
+    my @myargs = @_;
+    my $flattened = '';
+    my $tosock = 0;
+    my $show_headers = 1;       # Show headers by default
+    my $batch = 0;              # Single field only--meaningless
+    if (scalar(@myargs)) {
+        $flattened = ' ' . join(' ', @myargs);
+        if ($flattened =~ m/ n/i)  { $show_headers = 0; } # Noheaders
+        if ($flattened =~ m/ t/i)  { $tosock = 1; }       # Tosock
+        if ($flattened =~ m/ b/i)  { $batch = 1;  }       # Batch--tabs between fields
+    }
+
+    my $total_entries = 0;
+    my (@a_fields, @b_fields);
+
+    # Now show whitelist information
+    if ($show_headers) {
+        if ($tosock) {
+            $conn->print("IP addresses of whitelisted mail servers:\n");
+#            $conn->print('-' x 31, "\n");
+        }
+        write_log(LOG_DEBUG, "IP addresses of whitelisted mail servers:\n");
+#        write_log(LOG_DEBUG, ('-' x 52) . "\n");
+    }
+
+    if (scalar(keys(%ip_whitelist))) {
+        # First the whitelisted relay ips:
+        foreach my $key (sort {$a <=> $b} keys %ip_whitelist) {
+            # Sort the IP addresses (that start with this octet)
+            # We don't need to be concerned with $a_fields[0] etc.--
+            # All are the same in this inner loop.
+            my @sorted_nets = map  { $_->[0] }
+            sort {
+                @a_fields = @$a[1..$#$a];
+                @b_fields = @$b[1..$#$b];
+                $a_fields[1] <=> $b_fields[1]
+                    ||
+                    $a_fields[2] <=> $b_fields[2]
+                    ||
+                    $a_fields[3] <=> $b_fields[3]
+                }
+            map { [$_, split /\.|\//] } keys %{ $ip_whitelist{$key} };
+            
+            $total_entries += scalar(@sorted_nets);
+            foreach my $network (@sorted_nets) {
+                if ($tosock) {
+                    $conn->print("$network/$ip_whitelist{$key}{$network}\n"); 
+                }
+                write_log(LOG_DEBUG, "$network/$ip_whitelist{$key}{$network}\n");
+            }
+        }
+#        write_log(LOG_DEBUG, "---------------------\n");
+    }
+    $conn->print("\n");
+
+    if ($tosock && $show_headers) {
+#        unless ($batch) {
+#            $conn->print('-' x 52, "\n");
+#        }
+        $conn->print("Total whitelisted entries: $total_entries\n");
+    }
+
+    return;
+}
+
+################################################
+# ;;update_optins
+# Called when network client sends the UPDATE <user> command
+# over the socket I'm listening to.
+# Receive the <user>, then copy user's 
+# ~/mail/.greylist directory to
+# /etc/greylist/<user>
+# Return 'ok'
+sub update_optins {
+    my $user = shift;
+    ($user) = $user =~ m/^\s*(\S+)\s*$/;
+    unless (defined($user) && length($user)) {
+        write_log(LOG_ERR, "Socket UPDATE command missing <user> argument.\n");
+        return 'fail';
+    }
+    my $user_optin_file = (getpwnam $user)[7] . "/mail/.greylist";
+    unless (-f $user_optin_file ) {
+        write_log(LOG_ERR, "$user_optin_file does not exist\n");
+        return 'fail';
+    }
+
+    # Copy the file to /etc/greylist (or wherever configured)
+    if (system("cp -f $user_optin_file $conf{optin_dir}/$user")) {
+        # Status should have been 0
+        write_log(LOG_ERR, "Unable to copy $user_optin_file to $conf{optin_dir}/$user\n");
+        return 'fail';
+    }
+    system("chmod 600 $conf{optin_dir}/$user; chown root.root $conf{optin_dir}/$user");
+
+    return 'ok';
+}
+
+#####################################
+# ;;whitelist_net
+# Passed either a single IP address or a CIDR-specified
+# network (n.n.n.n/n), add the network/address to the
+# whitelist.
+# The 2nd arg is a reference to a hash of 
+# FIXME: Expand for IPv6
+sub whitelist_net {
+    my ($net, $hash_ref) = @_;
+    unless (defined($hash_ref)) {return;} # No arg received
+
+    # Let's have the hash key be just the first octet's character
+    # representation. (Assume that the mask will never be less than
+    # 8
+    if ($net =~ m/^((\d+)\.\d+\.\d+\.\d+)(?:\/(\d+))?$/) {
+        my $hash_key = $2;
+        my $net_ip = $1;
+        my $mask = defined($3) ? $3 : 32; # Mask is 32 for singleton IP addr
+
+        if (defined $$hash_ref{$hash_key}{$net_ip}) {
+            # Hmmm, we already have the IP address part of this CIDR
+            # network. Check the mask. If it is the <= to the $mask
+            # we're about to define, do nothing--the new net is already
+            # whitelisted and is subsumed by a larger one.
+            # IF, OTOH, the existing $mask is greater than the current
+            # one, the already-recorded net will be subsumed by the
+            # one we are about to add. Replace the current mask
+            # with the smaller (i.e. specifying a larger network)
+            # mask.
+            if ($$hash_ref{$hash_key}{$net_ip} > $mask) {
+                # The existing whitelist entry is for a network that
+                # is of smaller size than the one we are about to
+                # whitelist, replace it with the new mask
+                $$hash_ref{$hash_key}{$net_ip} = $mask
+            }
+        }
+        else {
+            # No match of the IP address portion. Just add it
+            $$hash_ref{$hash_key}{$net_ip} = $mask;
+        }
+    }
+    return;
+}
+
+##########################################
+# ;;write_log
+# Passed a message string and a "level",
+# write the string to log if the $level is
+# >= the configured (or set by command-line arg)
+# logging level.
+# If --debug option specified, always log, regardless
+# of the specified level
+sub write_log {
+    my ($level, @message) = @_;
+
+    my $log_level = $conf{log_level};
+
+    if (defined($debug) && $debug) {
+        $log_level = LOG_DEBUG; # Log everything
+    }
+    if ($log_level >= $level) {
+        if (defined($logfd)) {
+            $logfd->print(strftime("%b %e %H:%M:%S", localtime) . ": [$$] @message");
+        }
+        else {
+            warn scalar(localtime) . ": [$$] @message";
+        }
+    }
+}
+
+############################################
+# ;;dump_stats
+#
+sub dump_stats {
+    my $running = time() - $start[0];
+    $running ||= 1; # Don't like division by zero!!
+    my @uptime = gmtime($running);
+    my $rps = $stats{'02_Total_Requests_Since_Restart'} / $running;
+ 
+    purge_expired(); # Eliminate stale entries
+    if ($optins_wildcarded) {
+        $stats{'09_Total_Optin_Recipient_Addresses'} = 'Unlimited (wildcard)';
+        $stats{'10_Total_Optin_Recipient_Domains'} = 'Unlimited (wildcard)';
+    }
+    else {
+        $stats{'09_Total_Optin_Recipient_Addresses'} = keys %optin_rcpt_addr;
+        $stats{'10_Total_Optin_Recipient_Domains'} = keys %optin_rcpt_domain;
+    }
+    $stats{'13_Current_Number_of_Verified_Triplets'} = show_verified('COUNT');
+    $stats{'14_Current_Number_of_Greylisted_Triplets'} = show_greylisted('COUNT');
+ 
+    $conn->print(sprintf("%41s: %02d:%02d:%02d:%02d\n", "Uptime [dd:hh:mm:ss]", @uptime[7,2,1,0]));
+    $conn->print(sprintf("%41s: %-s\n", "Requests_per_Second", $rps));
+ 
+    foreach my $skey (sort(keys %stats)) {
+        $conn->print(sprintf("%41s: %-s\n", substr($skey,3), $stats{$skey}));
+    }
+
+}
+
+__END__
+
+=head1 NAME
+
+greylistd - Opt-in greylisting daemon for Exim email servers
+
+=head1 SYNOPSIS
+
+B<greylistd> [options]
+
+=head1 DESCRIPTION
+
+Respond to messages from Exim, sent on a Unix domain socket. Greylist,
+if appropriate, based on:
+
+=over 5
+
+=item 1.
+
+connecting mail server's IP address
+
+=item 2.
+
+sender's email address
+
+=item 3.
+
+recipient's email address
+
+=back
+
+Only domains or email addresses that have opted in are considered for
+greylisting, as follows:
+
+If the information triplet hasn't been encountered recently (within,
+say, 36 days or other configurable C<vfy_duration>), B<greylistd> notes
+the delivery attempt and defers the incoming email. If a second
+delivery attempt occurs within a configurable "retry window"
+(example: at least 10 seconds after the current attempt, but before 2
+hours have passed), B<greylistd> accepts the email and adds the triplet
+to a "verified" list with a timestamp. Future email is accepted
+without deferral, and B<greylistd> updates the timestamp with each new
+arrival.
+
+If a verified entry's timestamp indicates that no "matching" email has
+been received for a sufficiently "long" time (as specified by the
+C<vfy_duration> directive in the configuration file), B<greylistd> purges
+the entry from the verified list. If a later email arrives that would
+have matched the verified entry, B<greylistd> defers it the first time,
+then (if a second try is made during the retry window) adds it to the
+verified list again. The process repeats.
+
+=head1 OPTIONS
+
+B<greylistd> options (preceded by 1 or 2 hyphens) can be shortened to a
+unique prefix:
+
+B<--cfg=E<lt>filenameE<gt>, --config=E<lt>filenameE<gt>>
+
+=over 4
+
+Override the default (F</etc/greylistd.conf>) configuration file name
+with E<lt>filenameE<gt>.
+
+=back
+
+B<--debug, -d>
+
+=over 4
+
+Run in debug mode. If running as a daemon, write debug output to log, otherwise
+write to console.
+
+=back
+
+B<--loglevel=E<lt>nE<gt>>
+
+=over 4
+
+Control the severity of events written to the log file, where
+E<lt>nE<gt> is one of the following (in increasing verbosity):
+
+ 0   No logging
+ 1   Errors only
+ 2   Deferrals (greylisting) and first acceptance of email 
+ 3   Deliveries previously verified; expiration of verification
+ 4   Whitelisted or not opted in; re-read of optin/white lists
+ 5   Normal but significant events
+ 6   Information: Dump greylist/verified info to file
+ 7   Debug--verbose
+
+=back
+
+B<--nodaemon> 
+
+=over 4
+
+Do not become a daemon. (Run in the foreground instead, e.g. for
+debugging.)
+
+=back
+
+B<--help>
+
+=over 4
+
+Display this online help.
+
+=back
+
+B<-v, --version>
+
+=over 4
+
+Display the greylistd version and exit.
+
+=back
+
+=head1 NOTES
+
+=head2 Information Persistence
+
+B<greylistd> stores whitelists, optin lists, deferred (greylisted)
+entries and verified entries in Perl hash variables.
+
+B<greylistd> periodically writes deferred and verified entries to a
+CSV file (name specified as C<dumpfile> in the B<greylistd>
+configuration file) periodically (specified by C<dumpfreq> in the same
+file).  It also writes out the information on receipt of a TERM or INT
+signal (before exiting).
+
+On startup or restart, B<greylistd> reads the CSV file and "loads up"
+its whitelist and deferred hashes.
+
+=head2 Whitelists
+
+Greylisting isn't suitable for all email. When multiple servers
+(server farms) send mail for a given incoming domain, repeated
+delivery attempts are from different IP addresses, which results in
+indefinite greylisting and eventual delivery failure. 
+
+Those servers' IP addresses (specified as CIDR networks) should be
+listed in one or more files specified by the C<ip_whitelist_file>
+directive in the configuration file.
+
+Whitelist file entry examples:
+
+ 127.0.0.8/8
+ 64.12.136.0/24 64.12.137.0/24 64.12.138.0/24 # AOL
+ 152.163.225.0/24  # AOL
+ 205.188.0.0/16    # AOL
+
+Be sure to whitelist localhost (127.0.0.1) and your
+organization's local mail servers.
+
+=head2 Optin Files
+
+This version of B<greylistd> reads optin entries from user-specific
+files in a directory specified in greylistd.conf's optin_dir
+directive. (optin_dir's default name is /etc/greylist.) The names of
+the files in the optin_dir directory correspond to user names. Each
+file lists (one per line) recipient domains and addresses that should
+be greylisted.
+
+NOTE: To enable global optin of all domains/users, specify '*' as the
+name of the optin_dir in greylistd.conf.
+
+=head2 Configuring Exim 
+
+The exim configuration file should include a C<defer> directive near
+the end of the acl_smtp_rcpt access control list. The entry is
+probably most effective after all deny and defer entries, and probably
+before accept entries. Trial and error will identify the most
+effective place to put the following (possible) entry:
+
+
+ # Test for greylisting for domains we accept (or relay)
+ defer   message = Temporarily unable to process your email. Please try again later.
+         # Greylisting is considered only for domains we accept:
+         domains = +local_domains : +relay_domains
+         condition = ${readsocket{/ramdisk/var/spool/exim/greylistd.sock}\
+                      {IS_DEFERRED $sender_host_address $sender_address $local_part@$domain\n}\
+                      {3s}{}}
+         log_message = $sender_host_address $sender_address $local_part@$domain greylisted
+
+=head1 BUGS
+
+B<greylistd> doesn't support IPv6 (yet). Report other bugs to the
+author.
+
+=head1 SEE ALSO
+
+B<greyadm>
+
+=head1 AUTHOR 
+
+Weldon Whipple E<lt>weldon@whipple.orgE<gt>
+
+

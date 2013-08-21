@@ -1,0 +1,787 @@
+#!/usr/bin/perl -w
+#
+# Send commands to the greylistd to query/cleanup greylisting
+# Copyright (C) 2010  Weldon Whipple <weldon@whipple.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+use strict;
+use Getopt::Long;
+
+use IO::Socket;
+use IO::File;
+use POSIX qw(strftime);
+
+my $socketfile = '/ramdisk/var/spool/exim/greylistd.sock';
+my $logfile = '/var/log/greylistd.log';
+
+my $version = '1.3.2';
+
+my $help = 0;
+
+# If no arguments specified, use interactive mode
+unless (scalar(@ARGV)) {
+    go_interactive();
+    exit;
+}
+
+my %opt = ();
+#GetOptions (\%h, ’verbose’, ’debug’, ’filter’, ’size=i’);
+#if ( $verbose ) { ... }
+#if ( exists $h{filter} ) { ... option ’filter’ was specified ... }
+
+## Get options, if specified
+unless (GetOptions(\%opt, 
+                   'accepted|y',     # Log entries that have been accepted (on verified list)
+                   'denied|n',       # Log entries that have been denied (no longer greylisted, and not verified)
+                   'deferred|e',     # Log entries that are still greylisted
+                   'addresses|a',      # Show rcpt addresses that have opted in
+                   'batch',          # Tab-separated output fields in greylist/verified output
+                   'config|cfg=s',   # Which greylistd.conf to use?
+                   'domains|d',        # Show rcpt domains that have opted in
+                   'missingwl|f',    # Find possible missing whitelist entries
+                   'greylist',       # Show greylist (deferred entries)
+                   'help',           # Help
+                   'logstats',       # Log statistics
+                   'noheader',       # Omit header in show_* output
+                   'reload',         # Reload/restart greylistd
+                   'stats',          # Show statistics
+                   'verified|v',     # Show verified entries
+                   'version',        # Show version
+                   'whitelist',      # Show whitelisted IPs (relay server)
+                   )) { 
+    usage(); 
+    exit; 
+}
+
+# Shouldn't be any args left
+if (scalar(@ARGV)) {
+    usage();
+    exit;
+}
+
+if ($opt{help}) {
+    system("pod2text $0 | less -e");
+    exit;
+}
+
+if ($opt{version}) {
+    print "$version\n";
+    exit;
+}
+
+process_opt(%opt);
+
+exit;
+
+#####################################################
+# ;;commify
+#
+# C O M M I F Y
+#
+sub commify {
+    local $_  = shift;
+    s{(?<!\d|\.)(\d{4,})}
+    {my $n = $1;
+     $n=~s/(?<=.)(?=(?:.{3})+$)/,/g;
+                  $n;
+              }eg;
+     return $_;
+}
+
+#######################################################
+# ;;usage
+#
+sub usage {
+    die "For help, use option -h or --help.\n";
+}
+
+#######################################################
+# ;;process_opt
+# Process the options
+#
+sub process_opt {
+    my %o = @_;
+
+    if (exists $o{help}) {
+        system("pod2text $0 | less -e");
+        return;
+    }
+
+    my $sock_cmd = '';
+    
+    if    (exists $o{greylist})   { $sock_cmd = 'SHOW_GREYLISTED TOSOCK'; }
+    elsif (exists $o{verified})   { $sock_cmd = 'SHOW_VERIFIED TOSOCK'; }
+    elsif (exists $o{whitelist})  { $sock_cmd = 'SHOW_WHITELIST TOSOCK'; }
+    elsif (exists $o{domains})    { $sock_cmd = 'SHOW_OPTIN DOMAIN TOSOCK'; }
+    elsif (exists $o{addresses})  { $sock_cmd = 'SHOW_OPTIN ADDR TOSOCK'; }
+    elsif (exists $o{stats})      { $sock_cmd = 'STATS TOSOCK'; }
+    elsif (exists $o{reload})     { $sock_cmd = 'RELOAD'; }
+
+    if (length($sock_cmd) ) {
+        if (exists $o{batch})     { $sock_cmd .= ' BATCH'; }
+        if (exists $o{noheader})  { $sock_cmd .= ' NOHEADER'; }
+
+        unless (-S $socketfile) {
+            $socketfile = locate_socket();
+        }
+
+        my $host = IO::Socket::UNIX->new(Peer  => $socketfile,
+                                         Type  => SOCK_STREAM ) or die $!;
+
+        $host->print("$sock_cmd\n");
+        my $output;
+        $output = do { local $/; <$host> };
+        if (defined($output) && length($output)) {
+            print $output;
+        }
+        else {
+            print "Request submitted.\n";
+        }
+        $host->close();
+    }
+    elsif (exists $o{missingwl}) { # Server farm option (-f)
+        unless (-r $logfile) {
+            $logfile = locate_log();
+            # See if we found the log file
+            print "Log file $logfile doesn't exist or isn't readable\n" unless -r $logfile;
+        }
+        # Get the raw candidates out of the log file
+        print ("Reading log entries ...\n");
+        my @candidates = `cat $logfile | grep -v "hasn't opted in" | grep -v 'IP whitelisted' | grep 'DEFER' | sort -k 10 -k 12 -k 8 | uniq -D -f 9`;
+
+        my $fcounter = 0;
+        my $found_whitelisted_ip = 0;
+        if (scalar(@candidates)) {
+            foreach my $cand (@candidates) {
+                # Omit IPs where from and to addresses are the same
+                my ($mm, $dd, $time, $ip, $from, $to) = (split " ", $cand)[0, 1, 2, 7,9,11];
+                $from =~ s/,//g;
+                $time =~ s/:$//;  #Delete trailing :
+
+                if ($from eq $to) {
+                    next;               # Don't output this--to and from match
+                }
+
+                $fcounter++;
+                if ($fcounter == 1) {
+                    print("Current time: " . strftime("%F %T", localtime()) . "\n");
+                    print("Candidate IP:     From:                               To:                            Time of delivery attempt:\n");
+                    print('-' x 111, "\n");
+                }
+                if (is_whitelisted($ip)) {
+                    # IP has been whitelisted since being logged. Bracket the line
+                    printf("[%-15s] %-35s %-30s %3s %2s %8s\n", $ip, $from, $to, $mm, $dd, $time);
+                    $found_whitelisted_ip = 1;
+                }
+                else {
+                    printf("%-17s %-35s %-30s %3s %2s %8s\n", $ip, $from, $to, $mm, $dd, $time);
+                }
+            }
+            if ($fcounter) {
+                print('-' x 111, "\n");
+                print("Total log entries of mail from IP's possibly needing whitelisting: $fcounter\n");
+                if ($found_whitelisted_ip) {
+                    print("[Brackets] means IP is now whitelisted and can be ignored.\n");
+                }
+            }
+            else {
+                print "No entries from possible server farms identified in log file $logfile\n";
+            }
+        }
+        else {
+            print "No entries from possible server farms identified in log file $logfile\n";
+        }
+    }
+    elsif (exists $o{logstats}) {
+        show_log_info('logstats'); # Summary info about log entries
+    }
+    elsif (exists $o{denied}) {
+        show_log_info('denied');   # Logged deferrals no longer in grey or verified lists
+    }
+    elsif (exists $o{accepted}) {
+        show_log_info('accepted'); # Logged deferrals now in verified list
+    }
+    elsif (exists $o{deferred}) {  # Logged deferrals still greylisted
+        show_log_info('deferred');
+    }
+    else { 
+        go_interactive();
+    }
+}
+
+######################################################################
+# ;;go_interactive
+#
+# Since insufficient arguments were specified, we'll interact with the
+# user.  
+#
+sub go_interactive {
+    # Make sure root is running this ...
+    die "Only root can run this.\n" if $<;
+    my $choice = '';
+
+    unless (-S $socketfile) {
+        $socketfile = locate_socket();
+    }
+
+    while(1) {
+        $choice = '';
+        print <<"_MAIN_";
+
+Enter a letter to show info/do action ('q' to quit):
+Show:   (g) Greylist  (v) Verified   (w) Whitelist  (d) Optin domains  (a) Optin addresses
+        (s) Daemon stats 
+Logs:   (l) Log stats (n) Denied     (y) Accepted   (e) Deferred  (m) Missing whitelists(?)
+Action: (r) Restart daemon           (q) Quit  (h) Help 
+_MAIN_
+
+        print "\n--> ";
+
+        $choice = <STDIN>;
+        $choice ||= '';
+        chomp $choice;
+
+        %opt = ();
+        if    ($choice =~ m/^q/i)   { exit 1; }
+        elsif ($choice =~ m/^a\b/i) { $opt{addresses} = 1; process_opt(%opt);}
+        elsif ($choice =~ m/^d\b/i) { $opt{domains} = 1;   process_opt(%opt);}
+        elsif ($choice =~ m/^e\b/i) { $opt{deferred} = 1;  process_opt(%opt);}
+        elsif ($choice =~ m/^m\b/i) { $opt{missingwl} = 1; process_opt(%opt);}
+        elsif ($choice =~ m/^g\b/i) { $opt{greylist} = 1;  process_opt(%opt);}
+        elsif ($choice =~ m/^h\b/i) { $opt{help} = 1;      process_opt(%opt);}
+        elsif ($choice =~ m/^l\b/i) { $opt{logstats} = 1;  process_opt(%opt);}
+        elsif ($choice =~ m/^n\b/i) { $opt{denied} = 1;    process_opt(%opt);}
+        elsif ($choice =~ m/^r\b/i) { $opt{reload} = 1;    process_opt(%opt);}
+        elsif ($choice =~ m/^s\b/i) { $opt{stats} = 1;     process_opt(%opt);}
+        elsif ($choice =~ m/^v\b/i) { $opt{verified} = 1;  process_opt(%opt);}
+        elsif ($choice =~ m/^w\b/i) { $opt{whitelist} = 1; process_opt(%opt);}
+        elsif ($choice =~ m/^y\b/i) { $opt{accepted} = 1;  process_opt(%opt);}
+        else {
+            print "Unknown option.\n";
+        }
+
+    }
+}
+
+######################################################################
+# ;;locate_socket
+# greylistd's socket (apparently) wasn't where we expected. Let's
+# go looking.
+#
+sub locate_socket {
+    my $socket = '';            # Name of socket file
+    # Try the greylistd.conf file
+    my $cfgname = '/etc/greylistd.conf';
+    if (exists $opt{config}) {
+        $cfgname = $opt{config};
+    }
+
+    unless (-r $cfgname) {
+        die "Unable to locate/read greylistd configuration file.\n";
+    }
+
+    my $fh = new IO::File "< $cfgname";
+    unless (defined $fh) { 
+        die "Unable to open greylistd's configuration file $cfgname: $!\n"; 
+    }
+    
+    while (<$fh>) {
+        chomp;
+        if ((m/^\s*\#/) || (m/^\s*$/)) {
+            next;               # Skip comment/blank lines
+        }
+        
+        # These lines aren't comments; they all look like: <token> = <stuff-to-#>)
+        if (m/^\s*socket\s*=\s*([^\s\#]+)/) {
+            $socket = $1;       # Meaningful stuff after = (up to #)
+            if (-S $socket) {
+                last;          # We're done
+            }
+            else {
+                die "Socket specified in $cfgname doesn't exist\n";
+            }
+        }
+    }
+
+    close ($fh);
+
+    unless (-S $socket) {
+        die "Cannot find the socket greylistd is listening to.\n";
+    }
+    return $socket;
+}
+
+######################################################################
+# ;;locate_log
+# Find greylistd's log file
+#
+sub locate_log {
+    my $logname = '';           # Name of log file
+    # Try the greylistd.conf file
+    my $cfgname = '/etc/greylistd.conf';
+    if (exists $opt{config}) {
+        $cfgname = $opt{config};
+    }
+
+    unless (-r $cfgname) {
+        die "Unable to locate/read greylistd configuration file.\n";
+    }
+
+    my $fh = new IO::File "< $cfgname";
+    unless (defined $fh) { 
+        die "Unable to open greylistd's configuration file $cfgname: $!\n"; 
+    }
+    
+    while (<$fh>) {
+        chomp;
+        if ((m/^\s*\#/) || (m/^\s*$/)) {
+            next;               # Skip comment/blank lines
+        }
+        
+        # These lines aren't comments; they all look like: <token> = <stuff-to-#>)
+        if (m/^\s*log_file\s*=\s*([^\s\#]+)/) {
+            $logname = $1;       # Meaningful stuff after = (up to #)
+            if (-r $logname) {
+                last;          # We're done
+            }
+            else {
+                die "Log file specified in $cfgname isn't readable\n";
+            }
+        }
+    }
+
+    close ($fh);
+
+    unless (-r $logname) {
+        die "Cannot find the log file greylistd is logging to.\n";
+    }
+    return $logname;
+}
+
+
+######################################################################
+# ;;is_whitelisted
+# Ask the greylist daemon if a given IP address is whitelisted
+# Returns 0 if not whitelisted, else 1.
+#
+sub is_whitelisted {
+    my ($ip) = @_;
+    my $whitelisted = 0;
+
+    unless (-S $socketfile) {
+        $socketfile = locate_socket();
+    }
+
+    my $host = IO::Socket::UNIX->new(Peer  => $socketfile,
+                                     Type  => SOCK_STREAM );
+
+    return 0 unless $host;      # Serious business! Default to not whitelisted
+
+    $host->print("IS_WHITELISTED_IP $ip\n");
+    my $output;
+    $output = do { local $/; <$host> };
+    chomp $output;
+    if (defined($output) && ($output eq 'yes')) {
+        $whitelisted = 1;
+    }
+    $host->close();
+    return $whitelisted;
+}
+
+######################################################################
+# ;;show_log_info
+# Show information from the log(s) 
+# Accepts one of the following (mutually exclusive) argument values:
+#  1. logstats - Summary info about log entries
+#  2. denied   - Logged deferrals no longer in grey or verified lists
+#  3. accepted - Logged deferrals now in verified list
+#  4. deferred - Logged deferrals still greylisted
+#
+sub show_log_info {
+    my ($what) = @_;
+    unless (-r $logfile) {
+        $logfile = locate_log();
+        # See if we found the log file
+        unless (-r $logfile) {
+            print "Log file $logfile doesn't exist or isn't readable\n";
+            return;
+        }
+    }
+
+    my %greylist = ();
+    my %verified = ();
+
+    # Use hashes to avoid dupes in output
+    my %accepted = ();
+    my %denied   = ();
+    my %deferred = ();
+
+    # G E T   C U R R E N T   G R E Y L I S T
+    unless (-S $socketfile) {
+        $socketfile = locate_socket();
+        unless (-S $socketfile) {
+            print "Unable to locate greylistd socket\n";
+            return;
+        }
+    }
+
+    my $sock_cmd = 'SHOW_GREYLISTED TOSOCK BATCH NOHEADER';
+    my $host = IO::Socket::UNIX->new(Peer  => $socketfile,
+                                     Type  => SOCK_STREAM ) or die $!;
+
+    $host->print("$sock_cmd\n");
+    while (<$host>) {
+        my ($ip, $from, $to, $extra) = split("\t", $_, 4);
+        my ($ippfx) = $ip =~ /^\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\./; # 1st 3 pieces only
+        $greylist{"${ippfx}__${from}__${to}"} = 1;
+    }
+
+    $host->close;
+
+    # G E T   C U R R E N T   V E R I F I E D   L I S T
+    $sock_cmd = 'SHOW_VERIFIED TOSOCK BATCH NOHEADER';
+    $host = IO::Socket::UNIX->new(Peer  => $socketfile,
+                                     Type  => SOCK_STREAM ) or die $!;
+
+    $host->print("$sock_cmd\n");
+
+    while (<$host>) {
+        my ($ip, $from, $to, $extra) = split("\t", $_, 4);
+        my ($ippfx) = $ip =~ /^\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\./; # 1st 3 pieces only
+        $verified{"${ippfx}__${from}__${to}"} = 1;
+    }
+
+    $host->close;
+
+#    my ($bydomain, $byaddr);
+#    if (defined($domain) && length($domain)) {
+#        $bydomain = 1;
+#    }
+#    else {
+#        $bydomain = 0;
+#    }
+
+#    if (defined($addr) && length($addr)) {
+#        $byaddr = 1;
+#    }
+#    else {
+#        $byaddr = 0;
+#    }
+
+    my $num_deferred = 0;       # Total
+    my $num_greylisted = 0;     # Currently greylisted
+    my $num_verified = 0;       # Number verified
+    my $num_rejected = 0;       # Rejected (not greylisted or verified)
+    my $start_time = '';        # Time of first log entry
+    my $end_time = '';          # Time of last log entry
+
+    # R E A D   T H E   L O G
+    open(LOG, "< $logfile") or die("Unable to open log file $logfile: $!\n");
+
+    while (<LOG>) {
+        unless (length($start_time)) { # Get the start time
+            ($start_time) = $_ =~ /^(\S+ +\d+ \d\d:\d\d:\d\d)/;
+        }
+        unless (/ DEFER /) {
+            next;                   # We're interested only in DEFERred email
+        }
+
+        my ($ttime, $ip, $class_c, $from, $to, $todomain) 
+            = $_ =~ m/^(\S+ +\d+ \d\d:\d\d:\d\d).+? DEFER mail from ((\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}) address (.+?), to ([^@]+\@([^ ]+)) /;
+#        if ($bydomain && ($todomain ne $domain)) {
+#            next;                   # We're not interested in this "to" domain
+#        }
+
+#        if ($byaddr && ($to ne $addr)) {
+#          next:                     # We're not interested in this address
+#        }
+
+        $end_time = $ttime;
+        $num_deferred++;
+
+        # Is this verified at the moment?
+        if (defined($to) && length($to) && (exists $verified{"${class_c}__${from}__${to}"})) {
+            # It's been verified. It isn't a reject
+            $num_verified++;
+            if ($what eq 'accepted') {
+                $accepted{"${ip}__${from}__${to}"} = $ttime;
+            }
+            next;
+        }
+
+        # Is this still in the greylist? (If so, it hasn't been rejected ... yet
+        if (defined($to) && length($to) && (exists $greylist{"${class_c}__${from}__${to}"})) {
+            $num_greylisted++;
+            if ($what eq 'deferred') {
+                $deferred{"${ip}__${from}__${to}"} = $ttime;
+            }
+            next;
+        }
+
+        # We're still here. It was rejected
+        $num_rejected++;
+        if (($what eq 'denied') && defined($to) && length($to)) {
+            $denied{"${ip}__${from}__${to}"} = $ttime;
+        }
+    }
+
+    if ($what eq 'logstats') {
+        my ($percent_verified, $percent_greylisted, $percent_rejected) = (0,0,0);
+        if ($num_deferred > 0) {
+            $percent_verified = $num_verified / $num_deferred * 100;
+            $percent_greylisted = $num_greylisted / $num_deferred * 100;
+            $percent_rejected = $num_rejected / $num_deferred * 100;
+        }
+        
+        print  "Log begins at: $start_time\n";
+        print  "Last deferral: $end_time\n";
+        print  "     Deferrals           Total    %\n";
+        print  "------------------------------------\n";
+        printf("  Number verified: %10s  %5.1f\n", commify($num_verified), $percent_verified);
+        printf("  Number rejected: %10s  %5.1f\n", commify($num_rejected), $percent_rejected);
+        printf(" Still greylisted: %10s  %5.1f\n", commify($num_greylisted), $percent_greylisted);
+        printf("====================================\n");
+        printf("  Total deferrals: %10s  %5.1f\n", commify($num_deferred), 100.0);
+    }
+    elsif ($what eq 'denied') {
+        if (!scalar(%denied)) {
+            print("Number of distinct log entries--initially deferred--that failed to verify: 0\n");
+        }
+        else {
+            print("Relay IP:         From:                               To:                                Logged at:\n");
+            print('-' x 104, "\n");
+            foreach my $entry (sort(keys %denied)) {
+                my ($relayip, $fromaddr, $toaddr) =  split /__/, $entry;
+                print(sprintf("%-17s %-35s %-30s %19s\n", 
+                              $relayip, $fromaddr, $toaddr, $denied{$entry}));
+            }
+            print('-' x 104, "\n");
+            print('Number of distinct log entries--initially deferred--that failed to verify: ' . scalar(keys %denied) . "\n");
+        }
+    }
+    elsif ($what eq 'accepted') {
+        if (!scalar(%accepted)) {
+            print("Number of distinct log entries--initially deferred--that are now verified: 0\n");
+        }
+        else {
+            print("Relay IP:         From:                               To:                                Logged at:\n");
+            print('-' x 104, "\n");
+            foreach my $entry (sort(keys %accepted)) {
+                my ($relayip, $fromaddr, $toaddr) =  split /__/, $entry;
+                print(sprintf("%-17s %-35s %-30s %19s\n", 
+                              $relayip, $fromaddr, $toaddr, $accepted{$entry}));
+            }
+            print('-' x 104, "\n");
+            print('Number of distinct log entries--initially deferred--that are now verified: ' . scalar(keys %accepted) . "\n");
+        }
+    }
+    elsif ($what eq 'deferred') {
+        if (!scalar(%deferred)) {
+            print("Number of distinct log entries--initially deferred--that are STILL deferred (greylisted): 0\n");
+        }
+        else {
+            print("Relay IP:         From:                               To:                                Logged at:\n");
+            print('-' x 104, "\n");
+            foreach my $entry (sort(keys %deferred)) {
+                my ($relayip, $fromaddr, $toaddr) =  split /__/, $entry;
+                print(sprintf("%-17s %-35s %-30s %19s\n", 
+                              $relayip, $fromaddr, $toaddr, $deferred{$entry}));
+            }
+            print('-' x 104, "\n");
+            print('Number of distinct log entries--initially deferred--that are STILL deferred (greylisted): ' . scalar(keys %deferred) . "\n");
+        }
+    }
+
+    return;
+}
+
+__END__
+
+=head1 NAME
+
+greyadm - Administer the Greylist Daemon (greylistd)
+
+=head1 SYNOPSIS
+
+greyadm [options]
+
+=head1 DESCRIPTION
+
+Show the current state of or send administrative requests to the
+Greylist Daemon B<greylistd>.  
+
+If no options are specified, run interactively.
+
+=head1 OPTIONS
+
+Options (preceded by 1 or 2 hyphens) may be abbreviated to the
+shortest unique prefix. (Options are mutually exclusive, except
+for -n/--noheader, -b/--batch>, and --cfg/--config.)
+
+B<-g, --greylist>
+
+=over 4
+
+Show greylist (deferred) entries in greylistd's internal tables.
+
+=back
+
+B<-v, --verified>
+
+=over 4
+
+Show verified entries in greylistd's internal tables.
+
+=back
+
+B<-w, --whitelist>
+
+=over 4
+
+Show IP addresses of incoming servers that are never greylisted (as
+listed in greylistd's internal tables).
+
+=back
+
+B<-a, --addresses>
+
+=over 4
+
+Show recipient email addresses that have opted-in to greylisting.
+
+=back
+
+B<-d, --domains>
+
+=over 4
+
+Show recipient email domains that have opted-in to greylisting.
+
+=back
+
+B<-s, --stats>
+
+=over 4
+
+Show statistics returned by the greylist daemon.
+
+=back
+
+B<-l, --logstats>
+
+=over 4
+
+Show mail deferral statistics from entries in the current log.
+
+=back
+
+B<-n, --denied>
+
+=over 4
+
+Show log entries for mail--initially deferred (greylisted)--that
+failed to re-attempt delivery during the configured retry window.
+
+=back
+
+B<-y, --accepted>
+
+=over 4
+
+Show log entries for mail--initially deferred (greylisted)--that
+successfully re-attempted delivery during the configured retry window.
+
+=back
+
+B<-e, --deferred>
+
+=over 4
+
+Show log entries for deferred (greylisted) mail that has not yet been
+verified. (The congifured retry window is still open.)
+
+=back
+
+B<-m, --missingwl, -f>
+
+=over 4
+
+Show log entries for mail from IP's possibly needing
+whitelisting.
+
+=back
+
+B<-r, --reload>
+
+=over 4
+
+Reload/restart greylistd.
+
+=back
+
+B<-n, --noheader>
+
+=over 4
+
+Omit header lines in output (greylisted/verified options).
+
+=back
+
+B<-b, --batch>
+
+=over 4
+
+Separate greylist and verified output fields with tabs.
+
+=back
+
+B<--cfg=E<lt>filenameE<gt>, --config=E<lt>filenameE<gt>>
+
+=over 4
+
+Override the default (F</etc/greylistd.conf>) configuration file name
+with E<lt>filenameE<gt>, if necessary to locate the socket that
+B<greylistd> listens to.
+
+=back
+
+B<--help>
+
+=over 4
+
+Display this online help
+
+=back
+
+B<-v, --version>
+
+=over 4
+
+Display the B<greyadm> version and exit.
+
+=back
+
+=head1 BUGS
+
+Report bugs and enhancement requests to the author.
+
+=head1 SEE ALSO
+
+B<greylistd>
+
+=head1 AUTHOR 
+
+Weldon Whipple E<lt>weldon@whipple.orgE<gt>

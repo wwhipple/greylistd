@@ -1,0 +1,84 @@
+#!/usr/bin/perl -w
+
+# Find potential server farm among deferred greylistd.log entries
+#
+# Look for occurrences of two or more log entries that have the
+# same MAIL FROM and RCPT TO addresses with different relay IP addresses
+# A typical log entry might look like this:
+#
+# Mar  9 07:20:29: [32381] DEFER mail from 123.5.182.30 address shalt6@elengi.ru, to lordnuke@nukelandcinema.com (1st attempt)
+#
+use strict;
+use Getopt::Long;
+
+my %opt = ();                   # User-specified command-line options
+
+## Get options, if specified
+unless (GetOptions(\%opt, 
+                   'ipoctets=i',     # Number of leading octets that must match for the
+                                     #   relay server's IP address to be considered a candidate
+                                     # Possible values: 0,1,2,3
+                   'omit_dupe_addr', # Don't display entries where MAIL FROM and RCPT TO addresses
+                                     # are the same: e.g. Mail from mrwhipple@charminsqueezer.com 
+                                     # to mrwhipple@charminsqueezer.com
+                   'logfile=s',      # Name of logfile 
+#                  'formatted',      # Format output (some way)
+#                  'zipped',         # Is input file zipped?
+                   'help',           # Help
+                   )) { 
+    usage(); 
+    exit; 
+}
+
+if (scalar(@ARGV)) {
+    usage();
+    exit;
+}
+
+# Make sure root is running this ...
+die "Only root can run this.\n" if $<;
+
+if ((defined $opt{ipoctets}) && ($opt{ipoctets} > 3 || $opt{ipoctets} < 0)) {
+    die "Invalid value specified for --ipoctets option\n";
+}
+
+my $logfile = $opt{logfile};
+$logfile ||= '/var/log/greylistd.log'; # Default if not specified
+
+die "Log file $logfile doesn't exist or isn't readable\n" unless -r $logfile;
+
+# Get the raw candidates out of the log file
+my @candidates = `cat $logfile | grep -v "hasn't opted in" | grep -v 'IP whitelisted' | grep 'DEFER' | sort -k 10 -k 12 -k 8 | uniq -D -f 9`;
+
+unless (scalar(@candidates)) {
+    print "No candidate server farms identified in log file $logfile\n";
+    exit;
+}
+
+for (my $i = 0; $i < scalar(@candidates); $i ++) {
+    
+    if (defined($opt{omit_dupe_addr}) || defined($opt{ipoctets})) {
+        # separate out fields of interest
+        my ($ip, $from, $to) = (split " ", $candidates[$i])[7,9,11];
+        $from =~ s/,//g;
+
+        if ($opt{omit_dupe_addr} && ($from eq $to)) {
+            next;               # Don't output this--to and from match
+        }
+        
+#        if (defined($opt{ipoctets})) {
+#            if ($i == 0) {
+#                # This is the very first line; nothing to compare with
+#                next;
+#            }
+#            my @octets = (split '.'
+#        }
+
+    }
+
+    print $candidates[$i];
+
+}
+
+
+

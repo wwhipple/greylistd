@@ -1,0 +1,89 @@
+Installing greylistd
+
+ 1. copy greylistd to           /usr/local/sbin/greylistd
+ 2. copy greyadm to             /usr/local/sbin/greyadm
+ 3. copy greylistd.init to      /usr/local/sbin/greylistd.init
+    (Note: On Red Hat-like systems, this should be symlinked to 
+        /etc/init.d/greylistd for startup/shutdown.)
+
+    On Red Hat-like systems, issue the following command to enable
+    the service command:
+
+    # chkconfig --add greylistd
+
+ 4. copy greylistd.conf to      /etc/greylistd.conf
+ 5. copy greylistd_whitelist to /etc/greylistd_whitelist
+
+ 6. Edit exim.conf (or exim.conf.local); add entry to check_recipient
+    ACL, POSSIBLY following entries for mailman (mailing lists).
+    POSSIBLE format:
+
+ # Test for greylisting for domains we accept (or relay)
+ defer   message = Temporarily unable to process your email. Please try again later.
+         #skip if authenticated (with SMTP AUTH ...)
+         !authenticated = *
+         # Greylisting is considered only for domains we accept:
+         domains = +local_domains : +relay_domains
+         condition = ${readsocket{/ramdisk/var/spool/exim/greylistd.sock}\
+                      {IS_DEFERRED $sender_host_address $sender_address $local_part@$domain\n}\
+                      {5s}{}}
+
+         log_message = $sender_host_address $sender_address $local_part@$domain greylisted
+
+
+ 7. Start greylistd:
+   
+   # /usr/local/sbin/greylistd
+
+      OR
+
+   # /usr/local/sbin/greylistd.init start
+
+      OR
+
+   # service start
+
+ 8. Check /var/log/greylistd.log for errors
+
+ 9. Restart exim. Possibly:
+
+   # service exim restart
+
+10. Check exim logs.
+
+11. Start greyadm:
+
+    # /usr/local/sbin/greyadm
+
+12. In greyadm: 
+    
+    Enter 'w'
+    (Whitelisted IP addresses should appear)
+
+    Enter 'd'
+    (Optin domains should appear--if any)
+
+    Try other options
+
+13. Try greyadm with options:
+
+    # greyadm -d
+    # greyadm -w
+    [etc.]
+
+    (The options correspond to the single letter values of interactive
+    mode.)
+
+14. Tail /var/log/greylistd.log. Watch for mail to opted-in domain
+
+15. Set up log rotation for greylistd.log.
+
+16. Read:
+    admin/README.greyadm
+    README
+    README.man
+
+17. Watch the log for IP addresses that need to be added to 
+    /etc/greylistd_whitelist.
+
+18. Report bugs.

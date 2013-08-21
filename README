@@ -1,0 +1,279 @@
+Configure and Administer the Greylist Daemon (greylistd) for Exim
+
+Weldon Whipple <weldon@whipple.org>, March 23, 2011
+
+
+1. Foreword
+
+"Compliant" mail transfer agents (MTAs) try more than once to deliver
+e-mail to destination mail servers (RFC 2821). If a receiving server
+is temporarily unavailable and returns a "defer" (4xy) status, the
+sending server queues the email for later delivery. Greylisting
+servers exploit that "feature" to help eliminate unwanted email.
+
+Greylisting uses databases with a three-part key to process each
+incoming email:
+
+  1) IP address of the relay server (i.e. the incoming server that
+     contacts the recipient server)
+
+  2) The sender's full e-mail address (the envelope address specified
+     with SMTP's "MAIL FROM:" command).
+
+  3) The recipient's full e-mail address (the envelope address
+     specified with the "RCPT TO:" command).
+
+If incoming email matches no database entry, a receiving server that
+implements greylisting returns "defer" and stores the time in its
+"greylist" database. On the second delivery attempt, the receiving
+server finds a match in the greylist, returns "accept", and stores the
+time in the "verified" database.
+
+   Note: The times stored in the databases are used as (configurable)
+   time windows that specify the life span of greylist and verified
+   database entries.
+
+Later email that matches the verified list is accepted immediately.
+
+Note about this implementation: Instead of storing the full IP address
+of the relay server (1 above), greylistd stores the /24 (class c) address
+of the incoming relay server. This automatically accounts for "server
+farms" whose servers are all part of the same /24 network. This
+eliminates the need for a significant number of "server farm whitelists"
+(see next).
+
+
+2. Whitelists
+
+Greylisting doesn't work for all incoming mail:
+
+  1) When organizations have outgoing mail server farms, delivery
+     retries can be from a server with a different IP
+     address. (Google, AOL, Amazon.com, eBay, Southwest Airlines and
+     Yahoo! are examples of these.)  Conveniently, these large
+     organizations typically filter their outgoing mail internally, so
+     greylisting of these servers doesn't gain us much.
+
+  2) Some well-known organizations aren't compliant: Their sending
+     servers treat deferred delivery as failed delivery.
+
+The solution: Use whitelists to disable greylisting for those incoming
+servers.
+
+The default configuration file for greylistd (/etc/greylistd.conf)
+contains the following line:
+
+   ip_whitelist_file   = /etc/greylistd_whitelist
+
+The file /etc/greylistd_whitelist lists IP addresses (using CIDR
+notation) of well-known servers that need to be whitelisted. See the
+sample file greylistd_whitelist for the whitelisted IP addresses
+used by my employer on March 23, 2011.
+
+
+Be sure to whitelist localhost (127.0.0.1) and your organization's own
+IP addresses.
+
+If your servers already have files that list your organization's IP
+addresses or other addresses that you NEVER want to defer, you can
+reference them in additional ip_whitelist_file directive(s) in the
+greylistd configuration file:
+
+   ip_whitelist_file   = /etc/my_whitelist
+   ip_whitelist_file   = /etc/myother_whitelist
+
+Administrators should monitor email logs to notice other legitimate
+relay IPs that are being blocked by greylistd. Those should be added
+to greylistd_whitelist (or some other ip_whitelist_file).
+
+   Note: greylistd monitors changes to the whitelist files using
+   inotify. If you change any whitelist files while greylistd is
+   running, it will reread those files and update its whitelist
+   tables. (If you add IP whitelist files and change greylistd.conf,
+   you will need to restart greylistd to have it reread
+   greylistd.conf.
+
+
+3. Opting into Greylisting
+
+Greylisting isn't necessarily for everyone:
+
+  1) Some customers--who receive occasional mail from many different
+     sources--are annoyed if every email doesn't arrive instantaneously.
+
+  2) Others think that email should arrive instantaneously, always.
+
+  3) Others are skeptics.
+
+For this reason, greylistd requires users to opt in.
+
+
+3.1. Opting in by Recipient Domain or Email Address
+
+The greylistd configuration file's optin_dir directive references a
+directory that contains zero or more optin files. Each file contains
+zero or more domain names or email addresses--one per line. greylistd
+compares the domain names/addresses against the email address
+specified in the SMTP RCPT TO: command. If there is no match
+(indicating no opt-in), greylistd will not defer the email.
+
+
+   Note: The following two paragraphs are relevant to most installations,
+   but they are included here for completeness. (Most readers can skip
+   the paragraphs.)
+ 
+   greylistd monitors changes to the optin file(s) using
+   inotify. When a user opts in, the selected domains/email addresses
+   are written to a .greylist file in the user's home directory. A
+   zero-length file whose name is the username is created in the
+   /tmp/bh_greylist_update directory (as specified in the
+   greylistd.conf's optin_notify_dir directive). When inotify detects
+   a change in that directory, it copies the new .greylist file from
+   the user's home directory to /etc/greylist and refreshes its optin
+   structures.
+
+   At my employer, optin occurs as follows:
+     a) User opts in using cPanel, and submits the request.
+     b) updategreylist responds, copying user's greylist preferences
+        to ~/mail/.greylist beneath user's home directory.
+     c) updategreylist sends "UPDATE <user>" to greylistd through a
+        listening socket.
+     d) greylistd copies the user's .greylist file to /etc/greylist/<user>.
+     e) greylistd reads /etc/greylist/<user> and updates its optin
+        data structures.
+
+
+3.2. Global Optin
+
+To optin all users/domains on the box, you can specify asterisk ("*")
+as the name of the optin_dir in the greylistd configuration file:
+
+   optin_dir = *
+
+
+4. Configuration File
+
+The default configuration file is /etc/greylistd.conf. (You can change
+the default by passing the --cfg or --config option to greylistd--or
+by changing the perl code.)
+
+Besides the ip_whitelist_file and optin_dir entries mentioned above,
+the configuration file supports the following directives (shown with 
+their default values):
+
+
+dumpfile       = /etc/greylistd.data
+
+   greylistd saves greylisted and verified data across restarts by
+   writing data to a dumpfile periodically (also at shutdown). On
+   startup, greylistd reads the dumpfile to repopulate its greylist
+   tables.
+
+
+dumpfreq       = 300s
+
+   Time between autosaves of the greylist and verified list. (See
+   dumpfile above.)
+
+   Note: You may optionally include the suffixs s, m, h, d, w (for
+   seconds, minutes, hours, days, weeks). If the suffix is absent,
+   values are interpreted as seconds.
+
+
+second_try_min = 10s
+
+   The minimum time period that the sending MTA must wait before its
+   second delivery attempt (following the initial "defer" response).
+
+   If the second delivery attempt occurs before this minimum time has
+   lapsed, the mail is deferred again and the clock is reset.
+
+
+second_try_max = 2h     # Must knock second time within this time
+
+   The maximum time period that the sending MTA can wait before its
+   second delivery attempt (following the initial "defer" response).
+
+   If the second delivery attempt occurs after this maximum time has
+   lapsed, the mail is deferred again and the clock is reset.
+
+
+vfy_duration   = 31d   # Length of time inactive verified triplet remains verified
+
+   The length of time a verified entry will remain in effect if no
+   further email arrivals match the entry.
+
+   After that period of inactivity, the entry will be purged; future
+   arrivals will begin the greylisting process again.
+
+   (Note: A greylisting "triplet" becomes "verified" if the sending
+   server attempts a second delivery in the "window" defined by
+   second_try_min and second_try_max above. Once verified, subsequent
+   incoming mail whose triplet was previously verified will not be
+   deferred for the length of time specified in vfy_duration. With
+   each new arrival, the vfy_duration window is reset. The result is
+   that repeatedly matching mail that arrives every month will NEVER
+   be deferred.)
+
+
+log_file       = /ramdisk/var/log/greylistd.log
+
+   The name of greylistd's log file.
+
+
+log_level      = 5
+
+   Logging verbosity. The following are supported (in decreasing
+   verbosity):
+
+   7 - Most verbose (DEBUG-level)
+   6 - Informational: Dump greylist/verified info to file
+   5 - Notice (normal but significant events)
+   4 - Whitelisted arrivals and mail for users not opted in
+   3 - Verified previously; verification expired
+   2 - Deferred arrivals; also show first accept of previous deferral
+   1 - Errors: config error, unknown sock, bad IP, etc.
+   0 - Logging off
+
+
+socket         = /ramdisk/var/spool/exim/greylistd.sock
+
+   Unix domain socket used to communicate with Exim
+
+
+eximuser       = mailnull
+eximgroup      = nobody
+
+   User and group exim runs as. (greylistd--running as root--changes
+   ownership of the socket to these values so that exim can write/read
+   the socket.)
+
+
+pidfile        = /var/run/greylistd.pid
+
+   Name of file that stores running greylistd's process identifier.
+
+
+5. Exim Configuration File
+
+Exim calls greylistd with a readsocket entry in the check recipient
+ACL.  It should probably be placed after the "deny" entries, and
+before accept entries. Be sure not to greylist SMTP-authenticated
+incoming mail! It is often helpful to scan for viruses (etc.) AFTER
+the greylisting check. (Many of those emails will never try a second
+time and are effectively DENIED.)
+
+Sample entry:
+
+  defer   message = Temporarily unable to process your email. Please try again later.
+          # Never greylist mail if authenticated (with SMTP AUTH ...)
+          !authenticated = *
+          # Greylisting is considered only for domains we accept:
+          domains = +local_domains : +relay_domains
+          condition = ${readsocket{/ramdisk/var/spool/exim/greylistd.sock}\
+                       {IS_DEFERRED $sender_host_address $sender_address $local_part@$domain\n}\
+                       {5s}{}}
+          log_message = $sender_host_address $sender_address $local_part@$domain greylisted
+
+
+

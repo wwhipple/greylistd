@@ -1,0 +1,145 @@
+NAME
+    greylistd - Opt-in greylisting daemon for Exim email servers
+
+SYNOPSIS
+    greylistd [options]
+
+DESCRIPTION
+    Respond to messages from Exim, sent on a Unix domain socket. Greylist,
+    if appropriate, based on:
+
+    1.   connecting mail server's IP address
+
+    2.   sender's email address
+
+    3.   recipient's email address
+
+    Only domains or email addresses that have opted in are considered for
+    greylisting, as follows:
+
+    If the information triplet hasn't been encountered recently (within,
+    say, 36 days or other configurable "vfy_duration"), greylistd notes the
+    delivery attempt and defers the incoming email. If a second delivery
+    attempt occurs within a configurable "retry window" (example: at least
+    10 seconds after the current attempt, but before 2 hours have passed),
+    greylistd accepts the email and adds the triplet to a "verified" list
+    with a timestamp. Future email is accepted without deferral, and
+    greylistd updates the timestamp with each new arrival.
+
+    If a verified entry's timestamp indicates that no "matching" email has
+    been received for a sufficiently "long" time (as specified by the
+    "vfy_duration" directive in the configuration file), greylistd purges
+    the entry from the verified list. If a later email arrives that would
+    have matched the verified entry, greylistd defers it the first time,
+    then (if a second try is made during the retry window) adds it to the
+    verified list again. The process repeats.
+
+OPTIONS
+    greylistd options (preceded by 1 or 2 hyphens) can be shortened to a
+    unique prefix:
+
+    --cfg=<filename>, --config=<filename>
+
+        Override the default (/etc/greylistd.conf) configuration file name
+        with <filename>.
+
+    --debug, -d
+
+        Run in debug mode. If running as a daemon, write debug output to
+        log, otherwise write to console.
+
+    --loglevel=<n>
+
+        Control the severity of events written to the log file, where <n> is
+        one of the following (in increasing verbosity):
+
+         0   No logging
+         1   Errors only
+         2   Deferrals (greylisting) and first acceptance of email 
+         3   Deliveries previously verified; expiration of verification
+         4   Whitelisted or not opted in; re-read of optin/white lists
+         5   Normal but significant events
+         6   Information: Dump greylist/verified info to file
+         7   Debug--verbose
+
+    --nodaemon
+
+        Do not become a daemon. (Run in the foreground instead, e.g. for
+        debugging.)
+
+    --help
+
+        Display this online help.
+
+    -v, --version
+
+        Display the greylistd version and exit.
+
+NOTES
+  Information Persistence
+    greylistd stores whitelists, optin lists, deferred (greylisted) entries
+    and verified entries in Perl hash variables.
+
+    greylistd periodically writes deferred and verified entries to a CSV
+    file (name specified as "dumpfile" in the greylistd configuration file)
+    periodically (specified by "dumpfreq" in the same file). It also writes
+    out the information on receipt of a TERM or INT signal (before exiting).
+
+    On startup or restart, greylistd reads the CSV file and "loads up" its
+    whitelist and deferred hashes.
+
+  Whitelists
+    Greylisting isn't suitable for all email. When multiple servers (server
+    farms) send mail for a given incoming domain, repeated delivery attempts
+    are from different IP addresses, which results in indefinite greylisting
+    and eventual delivery failure.
+
+    Those servers' IP addresses (specified as CIDR networks) should be
+    listed in one or more files specified by the "ip_whitelist_file"
+    directive in the configuration file.
+
+    Whitelist file entry examples:
+
+     127.0.0.8/8
+     64.12.136.0/24 64.12.137.0/24 64.12.138.0/24 # AOL
+     152.163.225.0/24  # AOL
+     205.188.0.0/16    # AOL
+
+    Be sure to whitelist localhost (127.0.0.1) and your organization's local
+    mail servers.
+
+  Optin Files
+    This version of greylistd reads optin entries from user-specific files
+    in a directory specified in greylistd.conf's optin_dir directive.
+    (optin_dir's default name is /etc/greylist.) The names of the files in
+    the optin_dir directory correspond to user names. Each file lists (one
+    per line) recipient domains and addresses that should be greylisted.
+
+    NOTE: To enable global optin of all domains/users, specify '*' as the
+    name of the optin_dir in greylistd.conf.
+
+  Configuring Exim
+    The exim configuration file should include a "defer" directive near the
+    end of the acl_smtp_rcpt access control list. The entry is probably most
+    effective after all deny and defer entries, and probably before accept
+    entries. Trial and error will identify the most effective place to put
+    the following (possible) entry:
+
+     # Test for greylisting for domains we accept (or relay)
+     defer   message = Temporarily unable to process your email. Please try again later.
+             # Greylisting is considered only for domains we accept:
+             domains = +local_domains : +relay_domains
+             condition = ${readsocket{/ramdisk/var/spool/exim/greylistd.sock}\
+                          {IS_DEFERRED $sender_host_address $sender_address $local_part@$domain\n}\
+                          {3s}{}}
+             log_message = $sender_host_address $sender_address $local_part@$domain greylisted
+
+BUGS
+    greylistd doesn't support IPv6 (yet). Report other bugs to the author.
+
+SEE ALSO
+    greyadm
+
+AUTHOR
+    Weldon Whipple <weldon@whipple.org>
+

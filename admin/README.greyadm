@@ -1,0 +1,101 @@
+NAME
+    greyadm - Administer the Greylist Daemon (greylistd)
+
+SYNOPSIS
+    greyadm [options]
+
+DESCRIPTION
+    Show the current state of or send administrative requests to the
+    Greylist Daemon greylistd.
+
+    If no options are specified, run interactively.
+
+OPTIONS
+    Options (preceded by 1 or 2 hyphens) may be abbreviated to the shortest
+    unique prefix. (Options are mutually exclusive, except for
+    -n/--noheader, -b/--batch>, and --cfg/--config.)
+
+    -g, --greylist
+
+        Show greylist (deferred) entries in greylistd's internal tables.
+
+    -v, --verified
+
+        Show verified entries in greylistd's internal tables.
+
+    -w, --whitelist
+
+        Show IP addresses of incoming servers that are never greylisted (as
+        listed in greylistd's internal tables).
+
+    -a, --addresses
+
+        Show recipient email addresses that have opted-in to greylisting.
+
+    -d, --domains
+
+        Show recipient email domains that have opted-in to greylisting.
+
+    -s, --stats
+
+        Show statistics returned by the greylist daemon.
+
+    -l, --logstats
+
+        Show mail deferral statistics from entries in the current log.
+
+    -n, --denied
+
+        Show log entries for mail--initially deferred (greylisted)--that
+        failed to re-attempt delivery during the configured retry window.
+
+    -y, --accepted
+
+        Show log entries for mail--initially deferred (greylisted)--that
+        successfully re-attempted delivery during the configured retry
+        window.
+
+    -e, --deferred
+
+        Show log entries for deferred (greylisted) mail that has not yet
+        been verified. (The congifured retry window is still open.)
+
+    -m, --missingwl, -f
+
+        Show log entries for mail from IP's possibly needing whitelisting.
+
+    -r, --reload
+
+        Reload/restart greylistd.
+
+    -n, --noheader
+
+        Omit header lines in output (greylisted/verified options).
+
+    -b, --batch
+
+        Separate greylist and verified output fields with tabs.
+
+    --cfg=<filename>, --config=<filename>
+
+        Override the default (/etc/greylistd.conf) configuration file name
+        with <filename>, if necessary to locate the socket that greylistd
+        listens to.
+
+    --help
+
+        Display this online help
+
+    -v, --version
+
+        Display the greyadm version and exit.
+
+BUGS
+    Report bugs and enhancement requests to the author.
+
+SEE ALSO
+    greylistd
+
+AUTHOR
+    Weldon Whipple <weldon@whipple.org>
+

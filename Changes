@@ -1,0 +1,20 @@
+Revision history for Exim Greylist Daemon
+
+1.0.0  Mon Feb 15 10:17:02 MST 2010
+         - First version
+
+1.1.0  Thu Feb 18 10:53:03 MST 2010
+         - Eliminate optin_domains_file and optin_addrs_file in greylistd.conf
+         - Add optin_dir directive to greylistd.conf (contain's opted-in users'
+           optin address and domains)
+         - Add optin_notify_dir directive to greylistd.conf (temporary directory
+           that inotify watches to learn when users' optin domains/addresses change)
+
+1.1.20  Tue Feb 23 13:53:57 MST 2010
+         - Remove optin_notify_dir directive from greylistd.conf.
+         - Listen for "UPDATE <user>" command (on Unix domain socket) from 
+           updategreylist, indicating that user has updated optin preferences.
+
+1.2.1   Thu Mar 11 10:52:58 MST 2010
+         - Instead of using full IP address of incoming server, use class C
+           network

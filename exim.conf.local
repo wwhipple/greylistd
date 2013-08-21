@@ -1,0 +1,23 @@
+# Excerpt from the exim.conf file (for greylisting):
+#
+# ACL used after the RCPT command
+check_recipient:
+  # Start with blacklists, DNS blacklists and other deterministic means of
+  # blocking email
+  #
+  # Also include whitelisted senders and/or recipients that we want to ALWAYS 
+  # accept mail from.
+  #
+  
+  # Then test for greylisting for domains we accept (or relay)
+  defer   message = Temporarily unable to process your email. Please try again later.
+          #skip if authenticated (with SMTP AUTH ...)
+          !authenticated = *
+          # Greylisting is considered only for domains we accept:
+          domains = +local_domains : +relay_domains
+          condition = ${readsocket{/ramdisk/var/spool/exim/greylistd.sock}\
+                       {IS_DEFERRED $sender_host_address $sender_address $local_part@$domain\n}\
+                       {5s}{}}
+          log_message = $sender_host_address $sender_address $local_part@$domain greylisted
+
+  # Then other checks performed when the RCPT TO: command is received

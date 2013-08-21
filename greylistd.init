@@ -1,0 +1,53 @@
+# greylistd.init Start greylistd
+#
+# Author:        Weldon Whipple <weldon@whipple.org>
+#
+# chkconfig: 345 95 5
+# description: Greylist Daemon for Exim
+# processname: greylistd
+# pidfile: /var/run/greylistd
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+[ -x /usr/sec/bin/greylistd ] || exit 0
+
+RETVAL=0
+
+start() {
+	echo -n "Starting Greylist Daemon: "
+	daemon /usr/sec/bin/greylistd
+	RETVAL=$?
+	echo	
+	return $RETVAL
+}
+
+stop() {
+        echo -n "Stopping Greylist Daemon: "
+        killproc greylistd
+	RETVAL=$?
+        echo
+	return $RETVAL
+}
+
+# See how we were called.
+case "$1" in
+  start)
+        start
+        ;;
+  stop)
+	stop
+        ;;
+  status)
+        status greylistd
+        ;;
+  restart)
+	stop
+        start
+        ;;
+  *)
+        echo "Usage: $0 {start|stop|status|restart}"
+        exit 1
+esac
+
+exit
