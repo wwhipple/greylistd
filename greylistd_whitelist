@@ -84,7 +84,7 @@
 
 207.171.168.0/24 207.171.180.0/24 207.171.187.0/24 207.171.188.0/24 207.171.190.0/24 # Amazon.com
 
-211.29.132.0/24   # optusnet.com.au (wierd retry pattern)
+211.29.132.0/24   # optusnet.com.au (weird retry pattern)
 213.136.52.31/32  # Mysql.com (unique sender)
 217.158.50.178/32 # AXKit mailing list (unique sender)
 
